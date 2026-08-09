@@ -1,0 +1,17 @@
+services:
+  keepr:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Defaults to zero-download mock mode so `docker compose up` works
+      # out of the box. Switch to llama_cpp + a mounted data/models
+      # directory (see README.md) for real local inference.
+      LLM_DRIVER: mock
+      EMBEDDER: mock
+      VECTOR_INDEX_BACKEND: flat
+      DATABASE_PATH: data/keepr.db
+      INDEX_DIR: data/index
+      UPLOAD_DIR: data/uploads
+    volumes:
+      - ./data:/app/data

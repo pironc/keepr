@@ -1,0 +1,25 @@
+[package]
+name = "keepr"
+version = "0.1.0"
+description = "Privacy-first, local-first document RAG assistant"
+authors = ["Cyprien Piron"]
+edition = "2021"
+
+[lib]
+name = "keepr_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

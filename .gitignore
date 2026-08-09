@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/
+outputs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# PyInstaller
+*.spec
+
+# Test results
+test-results/
+
+# Claude Code
+.claude/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/keepr-backend*

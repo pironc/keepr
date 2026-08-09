@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>keepr</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="icon" type="image/png" href="/static/favicon.png" />
+  <link rel="preload" href="/static/fonts/BricolageGrotesque-700.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/static/fonts/Geist-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/static/fonts/JetBrainsMono-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/static/fonts/JetBrainsMono-500.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <script>
+    // Stamp persisted collapse states on <html> before first paint so the
+    // grid never flashes the wrong column widths.  CSS mirrors these onto
+    // the same grid-template-columns that [data-sidebar] / [data-sources-panel]
+    // use at runtime — see app.css for the paired :root rules.
+    (function(){
+      var h = document.documentElement;
+      if (localStorage.getItem("sidebar-collapsed") === "1") h.classList.add("sb-coll");
+      if (localStorage.getItem("sources-collapsed") === "1") h.classList.add("sp-coll");
+    })();
+  </script>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="brand" id="brand"><span class="brand-initial">k</span><span class="brand-rest">eepr</span></span>
+        <button type="button" id="sidebar-toggle" class="icon-btn sidebar-toggle" title="Toggle sidebar">
+          <img class="toggle-icon-collapse" src="/static/icons/panel-collapse.svg" alt="Collapse sidebar" />
+          <img class="toggle-icon-expand" src="/static/icons/panel-expand.svg" alt="Expand sidebar" />
+        </button>
+      </div>
+      <button id="new-chat-btn" class="new-chat-btn" type="button">
+        <svg class="new-chat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+        <span class="new-chat-label">New chat</span>
+      </button>
+      <button id="search-chats-btn" class="new-chat-btn search-chats-btn" type="button">
+        <svg class="new-chat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8" />
+          <path d="m21 21-4.3-4.3" />
+        </svg>
+        <span class="new-chat-label">Search</span>
+      </button>
+      <div class="sidebar-section-label" id="recents-label">Recents</div>
+      <div id="conversation-list" class="conversation-list"></div>
+    </aside>
+    <script>
+      // Apply sidebar collapsed class before paint (mirrors the html.sb-coll
+      // grid rule above — without this the internal labels/buttons flash
+      // expanded while the column is already narrow).
+      if (document.documentElement.classList.contains("sb-coll")) {
+        document.getElementById("sidebar").classList.add("collapsed");
+      }
+    </script>
+
+    <main class="chat-panel">
+      <div id="messages" class="messages"></div>
+
+      <div id="staged-tray" class="staged-tray"></div>
+
+      <form id="composer" class="composer">
+        <div id="drop-zone" class="drop-zone">
+          <textarea
+            id="prompt-input"
+            rows="1"
+            placeholder="Ask a question, or drop a file to add it to this conversation..."
+          ></textarea>
+          <button type="button" id="mic-btn" class="icon-btn" title="Dictate (hold to speak)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="22" />
+            </svg>
+          </button>
+          <input
+            id="file-input"
+            type="file"
+            multiple
+            hidden
+            accept=".pdf,.txt,.md,.mp3,.wav,.m4a,.mp4,.mov,.webm"
+          />
+          <button type="button" id="attach-btn" class="icon-btn" title="Attach files">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </button>
+          <button type="submit" id="send-btn" class="icon-btn send-btn" title="Send" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m22 2-7 20-4-9-9-4Z" />
+              <path d="M22 2 11 13" />
+            </svg>
+          </button>
+        </div>
+      </form>
+    </main>
+
+    <aside class="sources-panel" id="sources-panel">
+      <div class="sources-header">
+        <button type="button" id="sources-toggle" class="icon-btn sources-toggle" title="Toggle sources">
+          <img class="toggle-icon-doc" src="/static/icons/document.svg" alt="Sources" />
+          <img class="toggle-icon-collapse" src="/static/icons/panel-expand.svg" alt="Collapse sources" />
+          <img class="toggle-icon-expand" src="/static/icons/panel-collapse.svg" alt="Expand sources" />
+        </button>
+        <span class="sources-heading" id="sources-heading">Sources</span>
+      </div>
+      <div id="sources-list" class="sources-list"></div>
+    </aside>
+    <script>
+      if (document.documentElement.classList.contains("sp-coll")) {
+        document.getElementById("sources-panel").classList.add("collapsed");
+      }
+    </script>
+  </div>
+
+  <div id="delete-confirm" class="modal-backdrop" aria-hidden="true">
+    <div class="confirm-card">
+      <p class="confirm-message" id="confirm-message"></p>
+      <div class="confirm-actions">
+        <button type="button" class="confirm-btn confirm-btn-cancel" id="confirm-cancel">Cancel</button>
+        <button type="button" class="confirm-btn confirm-btn-delete" id="confirm-delete">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="citation-modal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-container">
+      <button type="button" class="icon-btn modal-close" id="modal-close" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+        </svg>
+      </button>
+      <div class="modal-body" id="modal-body">
+        <!-- PDF iframe or text snippet injected here -->
+      </div>
+    </div>
+  </div>
+
+  <div id="search-overlay" class="search-overlay" aria-hidden="true">
+    <div class="search-popup">
+      <div class="search-popup-header">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8" />
+          <path d="m21 21-4.3-4.3" />
+        </svg>
+        <input type="search" id="search-popup-input" placeholder="Search chats..." autocomplete="off" />
+        <button type="button" id="search-popup-close" class="icon-btn" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+          </svg>
+        </button>
+      </div>
+      <div id="search-popup-results" class="search-popup-results"></div>
+    </div>
+  </div>
+
+  <div id="rename-overlay" class="rename-overlay" aria-hidden="true">
+    <div class="rename-popup">
+      <p class="rename-heading">Rename this chat</p>
+      <input type="text" id="rename-input" class="rename-input" autocomplete="off" />
+      <div class="rename-actions">
+        <button type="button" id="rename-cancel" class="rename-btn rename-btn-cancel">Cancel</button>
+        <button type="button" id="rename-save" class="rename-btn rename-btn-save">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="global-drop-overlay" class="global-drop-overlay" aria-hidden="true">
+    <div class="global-drop-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="global-drop-icon">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+        <polyline points="17 8 12 3 7 8" />
+        <line x1="12" y1="3" x2="12" y2="15" />
+      </svg>
+      <p>Drop files to add them to this conversation</p>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

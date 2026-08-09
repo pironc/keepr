@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickkuk/nickkuk/master/crates/tauri-config-schema/schema.json",
+  "productName": "keepr",
+  "version": "0.1.0",
+  "identifier": "com.keepr.keepr",
+  "build": {
+    "devUrl": "http://localhost:8000",
+    "frontendDist": "../src/web",
+    "beforeDevCommand": "python3 -m uvicorn src.api.app:app --reload --reload-dir src --reload-dir src/web --host 127.0.0.1 --port 8000 --log-level warning"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "keepr",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 700,
+        "minHeight": 400,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src http://localhost:8000 http://127.0.0.1:8000; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "binaries/keepr-backend-*"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickkuk/nickkuk/master/crates/tauri-utils/schema/capability.json",
+  "identifier": "default",
+  "description": "Default capabilities for the keepr webview",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

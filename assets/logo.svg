@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 165 52" width="165" height="52">
+  <defs>
+    <style>
+      .keepr-wordmark { fill: #000000; }
+      @media (prefers-color-scheme: dark) {
+        .keepr-wordmark { fill: #ffffff; }
+      }
+    </style>
+  </defs>
+  <text x="82.5" y="38" text-anchor="middle"
+        font-family="Bricolage Grotesque, Inter, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif"
+        font-weight="700" font-size="52" letter-spacing="-0.5"
+        class="keepr-wordmark">keepr</text>
+</svg>

@@ -1,0 +1,1912 @@
+/* == Fonts ==
+   Vendored locally (src/web/static/fonts/) rather than linked from Google
+   Fonts — a CDN font request on first paint would break the air-gapped
+   claim the same way a CDN script tag would (see CLAUDE.md's rationale
+   for the zero-CDN frontend). Latin-subset only: covers English and
+   accented French text, which is what this app's own test documents use.
+   Source design system calls for rb-freigeist-neue / basier-square, both
+   proprietary; these are the Google Fonts stand-ins it names as fallback. */
+
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/static/fonts/BricolageGrotesque-700.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Geist";
+  src: url("/static/fonts/Geist-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/static/fonts/JetBrainsMono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/static/fonts/JetBrainsMono-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: block;
+}
+
+/* == Tokens: Cream & Ember ==
+   The page is never pure white and interactive surfaces are pills — the
+   two hallmarks of this system. Orange is reserved for the single primary
+   action (the send button); everything else earns attention through
+   colour-blocking (cream/bone/white/dark), not weight or shadow. */
+
+:root {
+  /* Grid — tracks sidebar widths so the centre column never slips
+     behind a fixed overlay.  Flash guards and responsive breakpoints
+     override these to 64 px when sidebars are collapsed. */
+  --sidebar-w: clamp(180px, 18vw, 240px);
+  --sources-w: clamp(200px, 22vw, 280px);
+
+  /* Colour */
+  --color-canvas: #f9f7f3;
+  --color-surface-bone: #f3f0e8;
+  --color-surface-white: #ffffff;
+  --color-surface-dark: #202020;
+
+  --color-ink: #202020;
+  --color-ink-mute: rgba(32, 32, 32, 0.6);
+  --color-on-dark: #f9f7f3;
+  --color-on-dark-mute: rgba(255, 255, 255, 0.6);
+
+  --color-orange: #ea2804;
+  --color-orange-press: #c01f00;
+  --color-green: #2b9a66;
+  --color-focus: rgba(59, 130, 246, 0.5);
+
+  --color-hairline: rgba(32, 32, 32, 0.12);
+  --color-hairline-on-dark: rgba(255, 255, 255, 0.2);
+
+  /* Not part of the source system (a marketing site has no upload/error
+     states to document) — added here so ingestion failures are legible,
+     kept far from --color-orange so it never reads as a second CTA. */
+  --color-error: #a13d2e;
+
+  /* Type */
+  --font-display: "Bricolage Grotesque", ui-sans-serif, sans-serif;
+  --font-ui: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  /* Spacing — 4px base */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radius */
+  --radius-pill: 9999px;
+  --radius-card: 10px;
+
+  --transition-control: 120ms ease;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-weight: 400;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  height: 100vh;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea {
+  font-family: inherit;
+}
+
+/* Three-column grid: sidebar-width | chat | sources-width.
+   The side columns match the fixed-overlay sidebars' widths exactly —
+   `--sidebar-w` and `--sources-w` are the same clamp() the sidebars use,
+   so the centre column's text area always starts after the left sidebar
+   ends and stops before the right sidebar begins, regardless of viewport
+   width.  Sidebars are out of flow (position:fixed); the grid columns
+   just reserve the breathing room. */
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr var(--sources-w);
+  height: 100vh;
+}
+
+/* -- sidebar -------------------------------------------------------- */
+
+.sidebar {
+  position: fixed;
+  left: 0;
+  top: 0;
+  height: 100vh;
+  width: clamp(180px, 18vw, 240px);
+  z-index: 10;
+  background: var(--color-surface-bone);
+  border-right: 1px solid var(--color-hairline);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow-y: auto;
+  transition: width 200ms ease;
+}
+
+.sidebar.collapsed {
+  width: 64px;
+  overflow-x: hidden;
+}
+
+/* Prevent a flash of the wrong sidebar width on page load when the
+   sidebar should start collapsed — stamps both the element width and
+   the matching grid column before first paint.  JS removes the html
+   class on init (see app.js) so this never outlives the flash guard. */
+html.sb-coll .sidebar {
+  width: 64px;
+  overflow-x: hidden;
+}
+html.sb-coll {
+  --sidebar-w: 64px;
+}
+
+/* -- sidebar header --------------------------------------------------- */
+
+.sidebar-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: clamp(28px, 3.5vw, 36px);
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  transition: padding 200ms ease;
+}
+
+/* Reclaims the header's side padding as the sidebar narrows — without
+   this, the 38px toggle button (revealed on hover) has nowhere to fit
+   in the 64px collapsed rail. Only ever affects the toggle's side (the
+   brand is pinned below, out of flow, so this never moves it). */
+.sidebar.collapsed .sidebar-header {
+  padding: 0;
+}
+
+/* Absolutely positioned with max-width placing the right edge (the
+   "blade") 2× farther from the navbar border than the button right
+   edge — so the brand wipe starts visibly left of the button-label wipe.
+   overflow: hidden + max-width transition is the sole clipping mechanism
+   (brand-rest has no max-width of its own — a single clean wipe). */
+.sidebar-header .brand {
+  position: absolute;
+  left: var(--space-2);
+  max-width: calc(100% - var(--space-3));
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 0;
+  overflow: hidden;
+  z-index: 1;
+  pointer-events: none;
+  transition: max-width 200ms ease;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(30px, 3.8vw, 40px);
+  line-height: 1;
+  letter-spacing: -0.3px;
+  color: var(--color-ink);
+}
+
+.brand-initial {
+  flex-shrink: 0;
+}
+
+.brand-rest {
+  white-space: nowrap;
+}
+
+.sidebar.collapsed .sidebar-header .brand {
+  max-width: 0.55em;
+}
+
+
+.sidebar-toggle {
+  flex-shrink: 0;
+  z-index: 0;
+}
+
+/* Toggle icons: show collapse (←) when expanded, expand (→) when collapsed.
+   Both icons are explicitly hidden in the collapsed state — only the
+   .settled-gated :hover rule below (which fires after the 200ms collapse
+   transition finishes) ever reveals the expand icon, so hovering during
+   the animation never flashes it early. */
+.sidebar:not(.collapsed) .toggle-icon-expand,
+.sidebar.collapsed .toggle-icon-collapse,
+.sidebar.collapsed .toggle-icon-expand {
+  display: none;
+}
+
+.sidebar.collapsed.settled .sidebar-header:hover .toggle-icon-expand {
+  display: block;
+}
+
+/* padding is the same clamp(8px, 1vw, 11px) in every state — the
+   (40px circle − 18px icon) / 2 = 11px math means the icon is already
+   centred by padding alone when the button reaches its collapsed
+   diameter, with zero justify-content changes needed.  The icon sits
+   at a fixed offset from the button's left edge the whole time and
+   never needs to be recentered as the label shrinks.
+   No explicit width in either state (stretch fills the content area),
+   but max-width does double duty:
+   • expanded: max-width: 100 % resolves to the content-area width
+     (e.g. 216 px) — a definite computed px value, so it provides a
+     transition start-point.
+   • collapsed: max-width uses the same clamp as height, capping the
+     button to a perfect circle at every viewport.
+   The transition on max-width (200ms ease) smoothly tracks the
+   sidebar's own width transition — both start from the same computed
+   value and end near the same target, avoiding the parallel-transition
+   drift that an explicit width: 100 % → 40 px caused. */
+.new-chat-btn {
+  background: #f7785c;
+  color: var(--color-on-dark);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 0 clamp(8px, 1vw, 11px);
+  font-size: 0.875rem;
+  font-weight: 400;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  height: clamp(30px, 3.8vw, 40px);
+  box-sizing: border-box;
+  overflow: hidden;
+  max-width: 100%;
+  transition: max-width 200ms ease, padding 200ms ease, background var(--transition-control);
+}
+
+.new-chat-btn:hover {
+  background: #e5664a;
+}
+
+/* Collapsed: max-width uses the same clamp as height so the button is
+   always a perfect circle.  max-width transitions smoothly from the
+   base 100 % (a definite computed px value, e.g. 216 px) down to the
+   clamp target — no snap, unlike width from auto.
+   Padding, icon position, and horizontal alignment are unchanged
+   across states so the icon stays at its fixed offset and is centred
+   by the base padding alone — 11 px + 18 px icon + 11 px = diameter.
+   align-self is left at default so the circle stays pinned to the
+   left during the sidebar animation. */
+.sidebar.collapsed .new-chat-btn {
+  max-width: clamp(30px, 3.8vw, 40px);
+}
+
+.new-chat-icon {
+  width: clamp(14px, 1.7vw, 18px);
+  height: clamp(14px, 1.7vw, 18px);
+  flex-shrink: 0;
+}
+
+/* No max-width or opacity of its own — the button's overflow: hidden
+   and its own min-width: 0 + overflow: hidden let the shrinking button
+   edge clip the text right-to-left as the button collapses.  margin-left
+   transitions to 0 so the text hugs the icon as space disappears.
+   The button's right edge IS the "razor blade." */
+.new-chat-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  margin-left: var(--space-2);
+  transition: margin-left 200ms ease;
+}
+
+.sidebar.collapsed .new-chat-label {
+  margin-left: 0;
+  pointer-events: none;
+}
+
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  opacity: 1;
+  transform: translateX(0);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.conversation-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--color-ink-mute);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.875rem;
+  transition:
+    background var(--transition-control),
+    color var(--transition-control);
+}
+
+.conversation-item:hover {
+  background: var(--color-surface-white);
+  color: var(--color-ink);
+}
+
+.conversation-item.active {
+  background: #f0442a;
+  color: var(--color-on-dark);
+}
+
+/* -- collapsed sidebar ------------------------------------------------ */
+
+/* Recents + its list are pushed left and faded rather than snapped to
+   display:none — same 200ms-ease timing as the .app grid-template-columns
+   transition that narrows the sidebar itself, so the content visually
+   rides along with the collapsing rail instead of vanishing ahead of it. */
+.sidebar.collapsed .sidebar-section-label,
+.sidebar.collapsed .conversation-list {
+  opacity: 0;
+  transform: translateX(-24px);
+  pointer-events: none;
+}
+
+/* By default the toggle is hidden in collapsed state; hovering the
+   header reveals it in place of the "k" mark.
+   While the collapse transition is still running (.collapsed but no
+   .settled yet) the entire header is pointer-events: none — this is the
+   nuclear option that guarantees no hover behaviour leaks through during
+   the 200ms animation regardless of any CSS rule interactions. */
+.sidebar.collapsed .sidebar-toggle {
+  display: none;
+}
+
+.sidebar.collapsed:not(.settled) .sidebar-header {
+  pointer-events: none;
+}
+
+/* Hard gate during the collapse transition — no rule, of any specificity,
+   can show the expand icon or hide the brand until .settled arrives. */
+.sidebar.collapsed:not(.settled) .toggle-icon-expand {
+  display: none !important;
+}
+
+.sidebar.collapsed:not(.settled) .sidebar-header .brand {
+  display: flex !important;
+}
+
+/* Unlike the collapse/expand transition, hover-to-reveal is a discrete,
+   momentary interaction rather than something to animate in lockstep —
+   swapping instantly here also sidesteps the 36px toggle button and the
+   clipped brand competing for space in the same 24px-ish gap.
+   Gated on .settled (added by app.js ~200ms after .collapsed, once the
+   width/padding/max-width transitions actually finish) so that clicking
+   the toggle button — while the cursor is still sitting right on top of
+   it — doesn't immediately satisfy this same :hover selector and hide
+   "k" via display:none before its clip-down animation ever gets to play. */
+.sidebar.collapsed.settled .sidebar-header:hover .brand {
+  display: none;
+}
+
+/* In the collapsed settled state, hovering reveals the expand button in
+   place of the "k".  The header switches to centre justification so the
+   toggle lands on the same vertical axis as the + and search icons in the
+   buttons immediately below. */
+.sidebar.collapsed.settled .sidebar-header:hover {
+  justify-content: center;
+}
+
+.sidebar.collapsed.settled .sidebar-header:hover .sidebar-toggle {
+  display: flex;
+  width: clamp(30px, 3.6vw, 38px);
+  height: clamp(30px, 3.6vw, 38px);
+}
+
+/* -- sidebar section label -------------------------------------------- */
+
+.sidebar-section-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-ink-mute);
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  opacity: 1;
+  transform: translateX(0);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+/* -- search chats ----------------------------------------------------- */
+
+/* Same mechanic as .new-chat-btn just above: padding is a constant
+   12px left/right in BOTH states — (40px circle − 2×1px border − 14px
+   icon) / 2 — so the magnifier sits at a fixed offset from the box's own
+   left edge and is never recentered as the input shrinks.
+   No width property, in either state, for the same reason as
+   .new-chat-btn above — .sidebar's default align-items: stretch already
+   fills this to the sidebar's current content width every layout tick.
+   An explicit width transitioning independently of the sidebar's own
+   grid-template-columns transition was two nominally-same-duration
+   animations that didn't actually track each other in real time, which
+   is what made this visibly lag behind the collapsing/expanding nav. */
+/* -- search popup ------------------------------------------------------ */
+
+.search-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+
+.search-overlay.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.search-popup {
+  width: min(440px, 90vw);
+  max-height: min(60vh, 480px);
+  background: var(--color-surface-white);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+}
+
+.search-popup-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-hairline);
+}
+
+.search-popup-header .search-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--color-ink-mute);
+}
+
+#search-popup-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  font-family: var(--font-ui);
+  font-size: 0.9375rem;
+  color: var(--color-ink);
+  outline: none;
+}
+
+#search-popup-input::-webkit-search-cancel-button {
+  display: none;
+}
+
+#search-popup-input::placeholder {
+  color: var(--color-ink-mute);
+}
+
+.search-popup-results {
+  overflow-y: auto;
+  padding: var(--space-2);
+}
+
+.search-result-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: var(--radius-card);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-ui);
+  font-size: 0.875rem;
+  color: var(--color-ink);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-result-item:hover,
+.search-result-item:focus-visible {
+  background: var(--color-surface-bone);
+  outline: none;
+}
+
+.search-result-empty {
+  padding: var(--space-2) var(--space-3);
+  text-align: center;
+  color: var(--color-ink-mute);
+  font-size: 0.875rem;
+}
+
+/* -- conversation context menu trigger -------------------------------- */
+
+.conversation-item {
+  position: relative;
+  /* Reserve space for the context-menu / pin trigger (position: absolute,
+     right: 4px, width: clamp(22px, 2.5vw, 26px)) so the title ellipsis
+     stops before it instead of flowing underneath. */
+  padding-right: 34px;
+}
+
+.conversation-item .conv-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-item .conv-abbrev {
+  display: none;
+}
+
+.conversation-item .pin-trigger,
+.conversation-item .context-menu-trigger {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--color-ink-mute);
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+  width: clamp(22px, 2.5vw, 26px);
+  height: clamp(22px, 2.5vw, 26px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Three-dot trigger: always visible. */
+.conversation-item .context-menu-trigger {
+  opacity: 1;
+}
+
+.conversation-item.menu-open .context-menu-trigger {
+  opacity: 1;
+}
+
+/* Pin trigger: replaces the three-dot kebab on pinned items. */
+.conversation-item .pin-trigger {
+  right: 4px;
+  opacity: 1;
+  color: var(--color-orange);
+}
+
+/* The trigger defaults to --color-ink-mute (dark), which disappears against
+   the selected conversation's dark pill — flip it to white.
+   The pin keeps its own colour on active items. */
+.conversation-item.active .context-menu-trigger {
+  color: var(--color-on-dark);
+}
+
+.conversation-item.active .pin-trigger {
+  color: var(--color-on-dark);
+}
+
+/* -- context menu ----------------------------------------------------- */
+
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-surface-white);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+  padding: var(--space-1);
+  min-width: 160px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.context-menu.show {
+  opacity: 1;
+}
+
+.context-menu button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--color-ink);
+  padding: var(--space-2) var(--space-3);
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-ui);
+}
+
+.context-menu button:hover {
+  background: var(--color-surface-bone);
+}
+
+.context-menu button.danger {
+  color: var(--color-error);
+}
+
+.context-menu .context-menu-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--color-ink-mute);
+}
+
+.context-menu button.danger .context-menu-icon {
+  color: var(--color-error);
+}
+
+/* -- rename popup ------------------------------------------------------ */
+
+.rename-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+
+.rename-overlay.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.rename-popup {
+  width: min(360px, 90vw);
+  background: var(--color-surface-white);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.rename-heading {
+  font-family: var(--font-ui);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-ink);
+  margin: 0;
+}
+
+#rename-input {
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.875rem;
+  font-family: var(--font-ui);
+  color: var(--color-ink);
+  background: var(--color-canvas);
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+#rename-input:focus-visible {
+  border-color: var(--color-focus);
+}
+
+.rename-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.rename-btn {
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: var(--space-2) var(--space-4);
+  font-size: 0.8125rem;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: background var(--transition-control);
+}
+
+.rename-btn-cancel {
+  background: transparent;
+  color: var(--color-ink-mute);
+}
+
+.rename-btn-cancel:hover {
+  background: var(--color-surface-bone);
+}
+
+.rename-btn-save {
+  background: var(--color-orange);
+  color: var(--color-on-dark);
+}
+
+.rename-btn-save:hover {
+  background: var(--color-orange-press);
+}
+
+/* -- chat panel ------------------------------------------------------ */
+
+.chat-panel {
+  grid-column: 2; /* always the centre column — fixed sidebars are out of flow */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* Without this, a flex column's automatic min-height default lets it grow
+     to fit however tall .messages' content is instead of the other way
+     around — the whole grid row overflows 100vh (clipped by body's
+     `overflow: hidden`, so the composer just vanishes off-screen) rather
+     than .messages scrolling internally the way its own overflow-y:auto
+     already says it should. */
+  min-height: 0;
+}
+
+.messages {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding: var(--space-6) 18%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  transition: opacity 150ms ease;
+  /* Query container for the shimmer prompt's font-size below — cqw scales
+     against this element's own (post-padding) available width, which
+     tracks sidebar/sources-panel collapse too, unlike vw which only sees
+     the raw window and under-shrinks once the fixed 240px/280px side
+     panels eat a bigger share of a narrower window. */
+  container-type: inline-size;
+}
+
+.messages.crossfading {
+  opacity: 0;
+}
+
+/* Snapshot of old content that fades out while .messages underneath
+   fades in — both at the same time, 150ms, for a true crossfade. */
+.messages-crossfade-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-6) 18%;
+  overflow-y: auto;
+  scrollbar-width: none;
+  background: var(--color-canvas);
+  transition: opacity 150ms ease;
+}
+
+.messages-crossfade-overlay.fading {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.messages::-webkit-scrollbar,
+.messages-crossfade-overlay::-webkit-scrollbar {
+  display: none;
+}
+
+/* When there are no messages yet, the empty-chat-prompt fills the area
+   and centres itself via the flex column's remaining space. */
+.messages:has(.empty-chat-prompt) {
+  justify-content: center;
+  align-items: center;
+  position: relative;
+}
+
+/* Horizontal ambient glow centred behind the empty-chat prompt — a wide
+   elliptical wash of orange/cream that drifts slowly and fades to
+   transparent at the edges.  Sized in cqw (container-query-width units)
+   so it scales down with the chat column as the window narrows or
+   sidebars expand.  Centred with margin:auto rather than transform so
+   the ambient-drift keyframes can animate transform independently.
+   Gated on :has(.empty-chat-prompt) so the glow disappears as soon as
+   the first message is rendered. */
+.messages:has(.empty-chat-prompt)::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: min(1000px, 120cqw);
+  height: min(280px, 34cqw);
+  margin: auto;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.7;
+  z-index: 0;
+  background: radial-gradient(
+    ellipse 85% 50% at center,
+    var(--color-orange) 0%,
+    var(--color-orange) 18%,
+    var(--color-canvas) 48%,
+    transparent 80%
+  );
+  animation: ambientDrift 15s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+
+@keyframes ambientDrift {
+  0%   { transform: translate(-2%, -1%) scale(0.95); }
+  50%  { transform: translate(2%, 1%) scale(1.05); }
+  100% { transform: translate(-1%, 2%) scale(1); }
+}
+
+.empty-chat-prompt {
+  /* The two prompt spans are stacked in this single grid cell (below)
+     rather than one in normal flow + one absolutely positioned over it.
+     Grid auto-sizes the cell to whichever of the two is currently wider,
+     so the incoming (fading-in) text is never clipped by a container
+     still sized for the outgoing (shorter) one mid-crossfade. */
+  display: grid;
+  text-align: center;
+  /* 1.5x smaller than the old fixed 32px (~21px). cqw ties this to
+     .messages' own available width (see container-type above) rather
+     than the raw window, so it — paired with the nowrap + shrink-to-fit
+     rules below — actually keeps every prompt on one line regardless of
+     how narrow the chat column gets, including from sidebar/sources
+     panels being open. */
+  font-size: clamp(14px, 3.9cqw, 21px);
+  font-family: var(--font-ui);
+  line-height: 1.5;
+  max-width: min(640px, 100%);
+  white-space: nowrap;
+  user-select: none;
+  position: relative;
+  z-index: 1;
+  min-height: 1.5em;
+}
+
+/* Each text span carries a shimmer — a brighter, fully-inked band sweeps
+   back and forth across muted letters.  background-size: 300% keeps the
+   gradient wide enough to always cover the text regardless of position,
+   so the text never disappears (the "deletion" effect caused by the
+   gradient sliding off the element).  Only the top (visible) span matters;
+   the hidden one underneath is at opacity 0.
+   `display: inline-block` (rather than `block`) is load-bearing: it
+   shrink-wraps each span to its own text's rendered width, so the
+   background-position sweep always traverses exactly the glyphs and
+   nothing else. */
+.prompt-text,
+.prompt-text-next {
+  grid-area: 1 / 1;
+  justify-self: center;
+  display: inline-block;
+  white-space: nowrap;
+  background: linear-gradient(
+    90deg,
+    var(--color-ink-mute) 0%,
+    var(--color-ink-mute) 38%,
+    var(--color-ink) 50%,
+    var(--color-ink-mute) 62%,
+    var(--color-ink-mute) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: textShimmer 3s ease-in-out infinite alternate;
+}
+
+@keyframes textShimmer {
+  0%   { background-position: 0% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.prompt-text {
+  opacity: 1;
+  transition: opacity 0.5s ease;
+}
+
+.prompt-text-next {
+  opacity: 0;
+  transition: opacity 0.5s ease;
+}
+
+/* -- message wrapper ---------------------------------------------------
+   Each message (user or assistant) is a standalone vertical block.
+   User: right-aligned compound stack (bubble + action buttons),
+         light orange background.
+   Assistant: left-aligned compound stack, dark-grey background — same
+         card shape as user, just a lighter shade of dark. */
+
+.message-wrapper {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.45;
+  font-size: 0.875rem;
+}
+
+.message-wrapper.user {
+  align-items: flex-end;
+}
+
+.message-wrapper.assistant {
+  align-items: flex-start;
+}
+
+/* User bubble — warm orange tint, darker than the earlier peach so it
+   reads clearly as "mine" against the canvas background. */
+.message.user {
+  max-width: 70%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-card);
+  white-space: pre-wrap;
+  background: #fde4d6;
+  color: var(--color-ink);
+}
+
+/* Assistant bubble — same bone as the sidebars, so the answer feels
+   part of the same surface rather than a disconnected card. */
+.message.assistant {
+  max-width: 70%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-card);
+  white-space: pre-wrap;
+  background: var(--color-surface-bone);
+  color: var(--color-ink);
+}
+
+/* During streaming the assistant wrapper gets white-space: pre-wrap for
+   bare text nodes; this is harmless once "done" fires and real <p>/<ul>/<pre>
+   elements replace the raw text. */
+.message-wrapper.assistant {
+  white-space: pre-wrap;
+}
+
+/* -- markdown blocks (see renderMessageContent in app.js) --------------
+   Assistant messages keep white-space: pre-wrap on the wrapper for bare
+   text nodes during streaming; these rules apply once real <p>/<ul>/<li>/...
+   elements exist, so a soft line break *within* one paragraph still shows
+   while blank-line-separated blocks get real spacing. */
+.bubble-content > *:first-child {
+  margin-top: 0;
+}
+
+.bubble-content > *:last-child {
+  margin-bottom: 0;
+}
+
+.bubble-content p {
+  margin: 0 0 var(--space-2);
+}
+
+.bubble-content ul,
+.bubble-content ol {
+  margin: 0 0 var(--space-2);
+  padding-left: 1.3em;
+}
+
+.bubble-content li {
+  margin: 0 0 4px;
+}
+
+.bubble-content h1,
+.bubble-content h2,
+.bubble-content h3,
+.bubble-content h4,
+.bubble-content h5,
+.bubble-content h6 {
+  margin: 0 0 var(--space-2);
+  font-size: 1em;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.bubble-content code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.bubble-content pre {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-card);
+  overflow-x: auto;
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+.bubble-content pre code {
+  background: transparent;
+  padding: 0;
+}
+
+/* Both bubbles now sit on light backgrounds (bone for assistant, warm
+   peach for user) — code gets a subtle dark overlay on each so inline
+   snippets and fenced blocks stay legible without jumping out. */
+.message.assistant .bubble-content code,
+.message.user .bubble-content code {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.message.assistant .bubble-content pre,
+.message.user .bubble-content pre {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+/* -- message action buttons (copy / edit, below user bubble) ------------ */
+
+.message-actions {
+  display: flex;
+  gap: var(--space-1);
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity var(--transition-control);
+}
+
+.message-wrapper.user:hover .message-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-ink-mute);
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+  width: clamp(22px, 2.6vw, 28px);
+  height: clamp(22px, 2.6vw, 28px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    background var(--transition-control),
+    color var(--transition-control);
+}
+
+.action-btn:hover {
+  background: var(--color-surface-bone);
+  color: var(--color-ink);
+}
+
+/* Non-terminal states (queued/retrieving/generating) reuse the sources
+   panel's ::before spinner technique; error keeps whatever partial content
+   was preserved and adds a distinct marker rather than hiding it. */
+.message-status {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-mute);
+  margin-bottom: var(--space-2);
+  /* sits at the top of the assistant bubble during streaming — push the
+     content below down so they never overlap */
+}
+
+.message-wrapper.status-queued .message-status::before,
+.message-wrapper.status-retrieving .message-status::before,
+.message-wrapper.status-generating .message-status::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--color-ink-mute);
+  border-top-color: transparent;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+.message-wrapper.status-error .message-status {
+  color: var(--color-error);
+}
+
+.citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* Metadata (filenames, counts) is mono and terse throughout this system. */
+.citation-badge {
+  background: var(--color-surface-bone);
+  border: 1px solid var(--color-hairline);
+  color: var(--color-ink-mute);
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  cursor: pointer;
+  max-width: 320px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  transition:
+    background var(--transition-control),
+    border-color var(--transition-control),
+    color var(--transition-control);
+}
+
+.citation-badge:hover {
+  background: var(--color-surface-white);
+  color: var(--color-ink);
+  border-color: var(--color-ink-mute);
+}
+
+/* Inline [N] markers stay ink, not orange — orange is a one-per-viewport
+   stamp and a message can carry several of these at once. */
+.citation-marker {
+  background: transparent;
+  border: none;
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  font-weight: 500;
+  vertical-align: super;
+  padding: 0 1px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.citation-marker:hover {
+  color: var(--color-orange);
+  text-decoration: underline;
+}
+
+/* -- staged files (pre-submit, client-side only) ---------------------- */
+
+.staged-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 0;
+  width: 76%;
+  max-width: 768px;
+  margin: 0 auto;
+}
+
+.staged-tray:not(:empty) {
+  padding-bottom: var(--space-2);
+}
+
+.staged-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--color-surface-white);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-pill);
+  padding: 4px 6px 4px var(--space-3);
+  font-size: 0.8125rem;
+}
+
+.staged-chip button {
+  background: transparent;
+  border: none;
+  color: var(--color-ink-mute);
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+  width: clamp(16px, 1.9vw, 20px);
+  height: clamp(16px, 1.9vw, 20px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--transition-control);
+}
+
+.staged-chip button svg {
+  width: clamp(11px, 1.3vw, 14px);
+  height: clamp(11px, 1.3vw, 14px);
+}
+
+.staged-chip button:hover {
+  background: var(--color-surface-bone);
+  color: var(--color-ink);
+}
+
+/* -- composer --------------------------------------------------------- */
+
+.composer {
+  position: relative;
+  padding: clamp(6px, 1.5vw, var(--space-4)) 0 clamp(10px, 3vw, var(--space-8));
+  width: 64%;
+  max-width: 768px;
+  margin: 0 auto;
+}
+
+.drop-zone {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: text;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(32, 32, 32, 0.08);
+  border-radius: clamp(20px, 2.8vw, 28px);
+  padding: clamp(6px, 1vw, var(--space-3));
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.07);
+  transition:
+    border-color var(--transition-control),
+    box-shadow var(--transition-control);
+}
+
+.drop-zone:focus-within {
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.10);
+}
+
+.drop-zone.drag-over {
+  border-color: var(--color-orange);
+}
+
+.drop-zone textarea {
+  flex: 1;
+  resize: none;
+  background: transparent;
+  border: none;
+  color: var(--color-ink);
+  font-size: 0.875rem;
+  font-family: var(--font-ui);
+  max-height: 160px;
+  outline: none;
+  padding: 0 0 0 var(--space-3);
+}
+
+.drop-zone textarea::placeholder {
+  color: var(--color-ink-mute);
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-ink-mute);
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+  width: clamp(28px, 3.5vw, 36px);
+  height: clamp(28px, 3.5vw, 36px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--transition-control);
+}
+
+.icon-btn svg {
+  width: clamp(13px, 1.6vw, 16px);
+  height: clamp(13px, 1.6vw, 16px);
+}
+
+/* All toggle icons share the same responsive size — sidebar (expanded
+   and collapsed hover) and sources panel alike.  Scales with viewport
+   width so the icons never overpower a narrow rail. */
+.toggle-icon-collapse,
+.toggle-icon-expand,
+.toggle-icon-doc {
+  width: clamp(14px, 1.5vw, 16px);
+  height: clamp(14px, 1.5vw, 16px);
+}
+
+.icon-btn:hover {
+  background: var(--color-surface-bone);
+  color: var(--color-ink);
+}
+
+/* Toggle icons loaded as <img> can't inherit currentColor — opacity
+   stands in for the muted/full-ink states the inline SVGs get for free. */
+.sidebar-toggle .toggle-icon-collapse,
+.sidebar-toggle .toggle-icon-expand,
+.sources-toggle .toggle-icon-doc,
+.sources-toggle .toggle-icon-collapse,
+.sources-toggle .toggle-icon-expand {
+  opacity: 0.6;
+  transition: opacity var(--transition-control);
+}
+
+.sidebar-toggle:hover .toggle-icon-collapse,
+.sidebar-toggle:hover .toggle-icon-expand,
+.sources-toggle:hover .toggle-icon-doc,
+.sources-toggle:hover .toggle-icon-collapse,
+.sources-toggle:hover .toggle-icon-expand {
+  opacity: 1;
+}
+
+.send-btn {
+  background: var(--color-orange);
+  color: var(--color-on-dark);
+}
+
+.send-btn:hover {
+  background: var(--color-orange-press);
+  color: var(--color-on-dark);
+}
+
+.send-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* -- focus -------------------------------------------------------------- */
+
+/* Remove macOS' default blue glow on every interactive element — replaced
+   below with a single custom ring shared by all focusable controls. */
+*:focus-visible {
+  outline: none;
+}
+
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+.citation-badge:focus-visible,
+.citation-marker:focus-visible,
+.staged-chip button:focus-visible,
+.drop-zone:focus-within,
+.search-result-item:focus-visible,
+#search-popup-input:focus-visible,
+.confirm-btn:focus-visible
+{
+  outline: 3px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+/* Don't double-ring the drop zone when it's inside :focus-within. */
+.drop-zone:focus-within button:focus-visible {
+  outline: none;
+}
+
+/* -- mic button recording state --------------------------------------- */
+
+#mic-btn.recording {
+  background: var(--color-orange);
+  color: var(--color-on-dark);
+  animation: pulse-recording 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-recording {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(234, 40, 4, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(234, 40, 4, 0); }
+}
+
+/* -- global drop overlay ---------------------------------------------- */
+
+.global-drop-overlay {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 200ms ease, visibility 200ms ease;
+}
+
+.global-drop-overlay.active {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.global-drop-box {
+  background: var(--color-surface-white);
+  border: 2px dashed var(--color-orange);
+  border-radius: 16px;
+  padding: var(--space-8) var(--space-6);
+  text-align: center;
+  max-width: min(400px, 90vw);
+}
+
+.global-drop-icon {
+  width: 48px;
+  height: 48px;
+  color: var(--color-orange);
+  margin-bottom: var(--space-4);
+}
+
+.global-drop-box p {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--color-ink);
+  font-family: var(--font-ui);
+}
+
+/* -- confirmation dialog ---------------------------------------------- */
+
+.confirm-card {
+  background: var(--color-surface-white);
+  border-radius: var(--radius-card);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  padding: var(--space-6);
+  max-width: min(440px, 90vw);
+  width: 90vw;
+  text-align: center;
+}
+
+.confirm-message {
+  margin: 0 0 var(--space-4);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--color-ink);
+  font-family: var(--font-ui);
+}
+
+.confirm-message strong {
+  font-weight: 700;
+  color: #000;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: center;
+}
+
+.confirm-btn {
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: var(--space-2) var(--space-6);
+  font-size: 0.875rem;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: background var(--transition-control);
+}
+
+.confirm-btn-cancel {
+  background: var(--color-surface-bone);
+  color: var(--color-ink);
+}
+
+.confirm-btn-cancel:hover {
+  background: var(--color-hairline);
+}
+
+.confirm-btn-delete {
+  background: var(--color-error);
+  color: var(--color-on-dark);
+}
+
+.confirm-btn-delete:hover {
+  background: #832f22;
+}
+
+/* -- citation modal --------------------------------------------------- */
+
+.modal-backdrop {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 200ms ease, visibility 200ms ease;
+}
+
+.modal-backdrop.active {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.modal-container {
+  background: var(--color-surface-white);
+  border-radius: 0;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  width: 70vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.modal-close {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  z-index: 1;
+  flex-shrink: 0;
+  background: var(--color-surface-white);
+}
+
+.modal-close:hover {
+  background: var(--color-surface-bone);
+}
+
+.modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.modal-body iframe,
+.modal-body embed {
+  width: 100%;
+  height: 100%;
+  min-height: 90vh;
+  border: none;
+}
+
+/* -- sources panel ----------------------------------------------------- */
+
+.sources-panel {
+  position: fixed;
+  right: 0;
+  top: 0;
+  height: 100vh;
+  width: clamp(200px, 22vw, 280px);
+  z-index: 10;
+  background: var(--color-surface-bone);
+  border-left: 1px solid var(--color-hairline);
+  padding: var(--space-3);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  transition: width 200ms ease;
+}
+
+.sources-panel.collapsed {
+  width: 64px;
+  overflow-x: hidden; /* clip content as it slides out past the shrinking edge */
+}
+
+/* Same flash guard as the sidebar — stamps the collapsed width before
+   first paint so the panel never renders at the expanded clamp() width. */
+html.sp-coll .sources-panel {
+  width: 64px;
+}
+html.sp-coll {
+  --sources-w: 64px;
+}
+
+/* -- sources header ---------------------------------------------------
+   Mirrors .sidebar-header's 36 px height and 0 var(--space-2) padding
+   so both headers occupy an identical horizontal band.  The toggle sits
+   at flex-start (left), the heading naturally follows to its right —
+   the inverse of the sidebar's brand-left / toggle-right layout, which
+   is correct for a right-hand panel. */
+
+.sources-header {
+  display: flex;
+  align-items: center;
+  height: clamp(28px, 3.5vw, 36px);
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  transition: padding 200ms ease;
+}
+
+.sources-heading {
+  overflow: hidden;
+  white-space: nowrap;
+  opacity: 1;
+  transition: opacity 200ms ease;
+  font-family: var(--font-ui);
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--color-ink-mute);
+}
+
+.sources-toggle {
+  flex-shrink: 0;
+}
+
+
+/* -- collapsed sources panel ------------------------------------------ */
+
+/* Mirror the sidebar's conversation-list: slide entries right and fade them
+   rather than snapping to display:none — same 24px, same 200ms-ease timing
+   as the panel's own width transition. */
+.sources-panel.collapsed .sources-list {
+  opacity: 0;
+  transform: translateX(24px);
+  pointer-events: none;
+}
+
+/* Collapsing fades the heading out in place. */
+.sources-panel.collapsed .sources-heading {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Sources toggle: three-icon system.
+   - Resting expanded: document icon
+   - Hover expanded: collapse icon replaces document
+   - Collapsed: expand icon (document + collapse hidden)
+   The toggle stays at flex-start in both states — no centering rule that
+   would cause a position jump.  pointer-events is disabled during the
+   collapse transition to prevent accidental interactions. */
+
+/* Expanded: hide collapse + expand, document icon visible by default. */
+.sources-panel:not(.collapsed) .toggle-icon-collapse,
+.sources-panel:not(.collapsed) .toggle-icon-expand {
+  display: none;
+}
+
+/* Expanded hover: swap document → collapse. */
+.sources-panel:not(.collapsed) .sources-toggle:hover .toggle-icon-doc {
+  display: none;
+}
+.sources-panel:not(.collapsed) .sources-toggle:hover .toggle-icon-collapse {
+  display: block;
+}
+
+/* Collapsed: hide document + collapse — expand icon is visible by default
+   (no rule hides it in collapsed settled state). */
+.sources-panel.collapsed .toggle-icon-doc,
+.sources-panel.collapsed .toggle-icon-collapse {
+  display: none;
+}
+
+/* While the collapse transition is still running (.collapsed but no
+   .settled yet) the entire header is pointer-events: none — guarantees
+   no hover behaviour leaks through during the 200ms animation. */
+
+.sources-panel.collapsed:not(.settled) .sources-header {
+  pointer-events: none;
+}
+
+/* Collapsed header keeps the same height so the toggle never jumps
+   vertically — only the horizontal padding is zeroed to reclaim room
+   for the 36 px button inside the 64 px rail (mirrors .sidebar). */
+.sources-panel.collapsed .sources-header {
+  padding: 0;
+}
+
+
+.sources-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  opacity: 1;
+  transform: translateX(0);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+/* Shown only when the list has zero children (innerHTML = "") —
+   the :empty check ignores ::after itself so there's no paradox. */
+.sources-list:empty::after {
+  content: "No sources yet";
+  display: block;
+  text-align: center;
+  font-family: var(--font-ui);
+  font-size: 0.8125rem;
+  color: var(--color-ink-mute);
+  padding: var(--space-3) 0;
+  opacity: 0.6;
+}
+
+.source-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between; /* name left, status right — single rigid pill */
+  gap: var(--space-2);
+  background: var(--color-surface-white);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8125rem;
+}
+
+.source-entry.highlight {
+  border-color: var(--color-focus);
+}
+
+.source-name {
+  flex: 1;
+  min-width: 0; /* allow shrink below content width for long filenames */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-status {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-ink-mute);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.source-entry.status-extracting .source-status,
+.source-entry.status-chunking .source-status,
+.source-entry.status-embedding .source-status,
+.source-entry.status-uploading .source-status {
+  color: var(--color-ink-mute);
+}
+
+.source-entry.status-extracting .source-status::before,
+.source-entry.status-chunking .source-status::before,
+.source-entry.status-embedding .source-status::before,
+.source-entry.status-uploading .source-status::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--color-ink-mute);
+  border-top-color: transparent;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+/* Green is reserved for run/completion status — matches "Indexed". */
+.source-entry.status-indexed .source-status {
+  color: var(--color-green);
+}
+
+.source-entry.status-error .source-status,
+.source-entry.status-unsupported .source-status {
+  color: var(--color-error);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* == Responsive auto-collapse ==========================================
+   When the viewport narrows past the point where expanded sidebars
+   overlap too much of the centre chat column, the sources panel is
+   hidden entirely and the sidebar collapses to a non-interactive icon
+   rail — neither can be usefully expanded at these widths. */
+
+/* == Responsive auto-collapse ==========================================
+
+   Two mechanisms, same visual result:
+
+   1. CSS @media queries (html:not(.js-resp) guard) — the JS-disabled
+      fallback.  Evaluated at the final viewport width after a resize
+      animation settles.
+
+   2. JS-driven classes (html.resp-*) — toggled by app.js's resize
+      handler on every animation frame, so sidebars collapse immediately
+      when the threshold is crossed during a smooth resize (e.g. macOS
+      double-click-title-bar snap).
+
+   When JS is enabled (.js-resp is on <html>), the media queries never
+   match — the resp-* classes and inline --sidebar-w/--sources-w custom
+   properties are the single source of truth. */
+
+/* --- JS-disabled fallback -------------------------------------------- */
+
+@media (max-width: 900px) {
+  html:not(.js-resp) {
+    --sources-w: 0;
+    --sidebar-w: 64px;
+  }
+  html:not(.js-resp) .sources-panel {
+    display: none;
+  }
+  html:not(.js-resp) .sidebar:not(.collapsed) {
+    width: 64px;
+    overflow-x: hidden;
+  }
+  html:not(.js-resp) .sidebar:not(.collapsed) .sidebar-section-label,
+  html:not(.js-resp) .sidebar:not(.collapsed) .conversation-list {
+    opacity: 0;
+    transform: translateX(-24px);
+    pointer-events: none;
+  }
+  html:not(.js-resp) .sidebar:not(.collapsed) .sidebar-header .brand {
+    max-width: 0.55em;
+  }
+  html:not(.js-resp) .sidebar:not(.collapsed) .new-chat-label {
+    margin-left: 0;
+    pointer-events: none;
+  }
+  /* Button max-width matches height for circle — see main comment. */
+  html:not(.js-resp) .sidebar:not(.collapsed) .new-chat-btn {
+    max-width: clamp(30px, 3.8vw, 40px);
+  }
+  html:not(.js-resp) .sidebar:not(.collapsed) .sidebar-header {
+    padding: 0;
+  }
+  html:not(.js-resp) .sidebar-toggle {
+    pointer-events: none;
+  }
+  html:not(.js-resp) .toggle-icon-collapse,
+  html:not(.js-resp) .toggle-icon-expand {
+    display: none;
+  }
+}
+
+/* --- JS-driven responsive classes (mirrors the media queries above) -- */
+
+/* Sources panel hidden — set by JS when window.innerWidth ≤ 900 */
+html.resp-sources-hidden {
+  --sources-w: 0;
+}
+html.resp-sources-hidden .sources-panel {
+  display: none;
+}
+
+/* Sidebar auto-collapsed — set by JS when window.innerWidth ≤ 900.
+   Mirrors .sidebar.collapsed rules so content is hidden regardless of
+   whether the .collapsed class landed on the sidebar element itself. */
+html.resp-sidebar-collapsed .sidebar {
+  width: 64px;
+  overflow-x: hidden;
+}
+html.resp-sidebar-collapsed .sidebar .sidebar-header {
+  padding: 0;
+}
+html.resp-sidebar-collapsed .sidebar-section-label,
+html.resp-sidebar-collapsed .conversation-list {
+  opacity: 0;
+  transform: translateX(-24px);
+  pointer-events: none;
+}
+html.resp-sidebar-collapsed .sidebar .sidebar-header .brand {
+  max-width: 0.55em;
+}
+html.resp-sidebar-collapsed .sidebar .new-chat-label {
+  margin-left: 0;
+  pointer-events: none;
+}
+/* Button max-width matches height for circle — see main comment. */
+html.resp-sidebar-collapsed .sidebar .new-chat-btn {
+  max-width: clamp(30px, 3.8vw, 40px);
+}
+html.resp-sidebar-collapsed .sidebar .sidebar-toggle {
+  display: none;
+}
+
+/* --- Window resize: kill all transitions so the sidebar snaps ---------- */
+
+/* While the user is actively dragging the window edge, every CSS
+   transition inside the sidebar is suppressed — the responsive collapse
+   should track the window size instantly, not animate with a delay.
+   The .resizing class is added on the first resize event and removed
+   ~150 ms after the last one (see app.js).  Manual toggle clicks are
+   unaffected because no resize is in flight at that point. */
+html.resizing .sidebar,
+html.resizing .sidebar * {
+  transition: none !important;
+}
+
