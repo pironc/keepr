@@ -19,9 +19,9 @@ so cancellation safety and the LockedEmbedder lock are both preserved.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from collections.abc import Callable
-from typing import Any, TypeVar
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -85,10 +85,7 @@ class LlamaCppEmbedder:
         await loop.run_in_executor(None, self.unload)
 
 
-_T = TypeVar("_T")
-
-
-async def _run_sync_uncancellable(func: Callable[..., _T], *args: Any) -> _T:
+async def _run_sync_uncancellable[T](func: Callable[..., T], *args: Any) -> T:
     """Run *func* in a thread-pool thread, suppressing asyncio cancellation
     until the thread finishes.
 

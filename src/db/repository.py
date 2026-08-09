@@ -393,7 +393,7 @@ class Repository:
 
 
 def _conversation_from_row(row: Any) -> Conversation:
-    pinned = bool(row["pinned"]) if "pinned" in row.keys() else False
+    pinned = bool(row["pinned"]) if "pinned" in row else False
     return Conversation(
         id=row["id"], title=row["title"], pinned=pinned, created_at=row["created_at"], updated_at=row["updated_at"]
     )

@@ -131,7 +131,8 @@ function(){})},800)})();
 
 
 def _render_index() -> HTMLResponse:
-    html = open(_INDEX_HTML, "r", encoding="utf-8").read()
+    with open(_INDEX_HTML, encoding="utf-8") as f:
+        html = f.read()
     html = html.replace("</html>", _INJECT_RELOAD.replace("__STARTUP__", str(_STARTUP)))
     return HTMLResponse(html)
 

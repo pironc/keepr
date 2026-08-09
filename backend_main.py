@@ -30,6 +30,7 @@ else:
     )
 
 import uvicorn  # noqa: E402
+
 from src.api.app import app  # noqa: E402
 
 if __name__ == "__main__":

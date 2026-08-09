@@ -437,7 +437,6 @@ async def test_cancelled_embedder_does_not_release_lock_until_thread_finishes() 
     This test proves the lock stays held through multiple cancellations and
     the eventual embedding completes normally.
     """
-    from unittest.mock import MagicMock
 
     from src.embeddings.llama_cpp_embedder import _run_sync_uncancellable
 
@@ -446,7 +445,6 @@ async def test_cancelled_embedder_does_not_release_lock_until_thread_finishes() 
 
     def slow_work(seconds: float) -> None:
         thread_running["started"] = True
-        import time
         time.sleep(seconds)
         thread_running["finished"] = True
 
