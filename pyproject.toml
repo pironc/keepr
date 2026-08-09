@@ -14,10 +14,12 @@ dependencies = [
     "numpy>=2.1",
     "psutil>=6.0",
     "pypdf>=5.0",
-    "llama-cpp-python>=0.3.2",
 ]
 
 [project.optional-dependencies]
+llama = [
+    "llama-cpp-python>=0.3.2",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
