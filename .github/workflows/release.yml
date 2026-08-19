@@ -97,7 +97,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: pip install -e . pyinstaller
+        run: pip install -e ".[llama]" pyinstaller
 
       - name: Build backend binary (PyInstaller)
         shell: bash
@@ -107,6 +107,7 @@ jobs:
             --hidden-import pypdf \
             --hidden-import aiosqlite \
             --hidden-import huggingface_hub \
+            --collect-all llama_cpp \
             backend_main.py
 
       - name: Copy backend binary for Tauri
