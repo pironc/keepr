@@ -10,11 +10,14 @@ machine without a rewrite. If you only read one section, read
 
 1. You drop a file into a conversation and hit send. The file is **staged
    client-side only** — nothing is uploaded until you submit.
-2. On submit, the file streams to the backend and goes through one
-   pipeline regardless of type: **extract → chunk → embed → index**,
-   emitting a status event at each stage over the same connection used
-   for the answer (`document_status` events drive the UI's per-file
-   spinner-to-checkmark animation in real time, not a fake timer).
+2. On submit, the file streams to the backend, which persists it and hands
+   it to `IngestionWorker` — a background task, not this request — to run
+   the one pipeline every source type shares: **extract → chunk → embed →
+   index**. The same connection used for the answer reports each stage as
+   it happens (`document_status` events drive the UI's per-file
+   spinner-to-checkmark animation in real time, not a fake timer), but
+   isn't what's *doing* the work — closing that connection mid-embed
+   doesn't stop it, exactly like step 7 below for the answer itself.
 3. Your question is embedded and compared against every chunk indexed
    *in that conversation* (not globally — see
    [Per-conversation retrieval scope](#per-conversation-retrieval-scope)).
@@ -33,19 +36,22 @@ machine without a rewrite. If you only read one section, read
    Anything else is discarded — the model cannot fabricate a citation to
    a document that was never in front of it, because citation validity is
    a set-membership check, not something the model self-reports.
-7. None of step 3–6 is actually tied to your browser tab. The moment you
-   hit send, `GenerationWorker` (see
+7. None of step 2–6 is actually tied to your browser tab. The moment you
+   hit send, `IngestionWorker` and `GenerationWorker` (see
    [Resilient, queued message generation](#resilient-queued-message-generation))
-   takes over as a background task independent of your connection — if you
-   refresh, only your *view* of it disconnects; the answer keeps generating
-   and lands in the database regardless, and reloading the page reattaches
-   to it, live, wherever it's gotten to.
+   take over as background tasks independent of your connection — if you
+   refresh, only your *view* disconnects; ingestion keeps embedding and the
+   answer keeps generating regardless, landing in the database either way,
+   and reloading the page reattaches to both, live, wherever they've gotten
+   to. See CLAUDE.md's "Rule #1" — this isn't incidental, it's the rule the
+   whole backend is built to.
 
 ## Technology choices, and why
 
 | Layer | Choice | Why this, not the obvious alternative |
 |---|---|---|
 | **LLM serving** | `llama-cpp-python` (GGUF) | Ollama is faster to a demo, but it's a black box for exactly the internals worth understanding (quant format, context window, KV-cache sizing) — and as of its MLX backend switch on Apple Silicon, "how Ollama works" is now platform-dependent. `llama-cpp-python` gives real GGUF/K-quant/mmap internals from one codebase across Metal, CUDA, and CPU. |
+| **Cross-turn KV cache** | Deliberately not enabled (`cache_prompt` off) | llama.cpp's `cache_prompt` only pays off via prefix reuse, and this prompt has no reusable prefix: the system message is rebuilt every turn carrying the freshly-retrieved `<context>` chunks, so the first differing token lands early in the prompt and almost nothing is reused. The expensive input (the retrieved context block) is recomputed every answer regardless. A shared-cache would also hold the KV cache resident in RAM between calls. The higher-leverage improvement when multi-turn latency ever matters is trimming old history / adaptive retrieval size — actual token savings — not KV caching. Also see the KVs-don't-persist note in [`src/rag/prompts.py`](src/rag/prompts.py). |
 | **Model** | `Qwen3-8B`, Q6_K | Swapped from Llama 3.1 8B for the same reason as the embedder above: multilingual support became an explicit requirement. This replaces an earlier version of this row that claimed in-repo "controlled testing" found Llama more reliable than Qwen — that was never true; no eval script, results file, or commit history for such a test exists anywhere in this repo, and the sentence should never have stated it as fact. The actual, sourced (not self-measured) reasoning: Qwen models consistently lead Chinese-language benchmarks by a wide margin (~69 vs. ~44–50 on aggregate Chinese tasks across Gemma/Llama, third-party-reported) and multilingual MMLU (~80 vs. ~72) — a training-data-composition effect, not a marketing one. Q6_K rather than a leaner quant for the same reason as before: memory budget has room to spare. Newer Qwen3.5/3.6 releases moved to bigger-dense or MoE variants, deliberately not chased here — this machine's *unified* memory means an MoE model's inactive experts still occupy real RAM (no separate VRAM pool to offload them to), so the 8B dense model is the better fit for *this* hardware, not just the cautious pick. This choice still isn't backed by an in-repo eval — see the "labeled grounding eval set" gap below, which would close exactly that hole. |
 | **Embeddings** | `nomic-embed-text-v2-moe` (GGUF, via the same `llama-cpp-python`) | Multilingual (~100 languages, 8-expert MoE) was the explicit driver — the prior `v1.5` is English-only. Same GGUF path, same 768-dim default, same `search_document:`/`search_query:` prefix convention as v1.5, so this was a same-size (~512MB Q8_0) drop-in swap: no new dependency, no retrieval code path changed. Live-verified: same-language queries score ~0.40–0.54 cosine similarity against genuinely relevant chunks, cross-lingual (English query, French document) still scores ~0.28–0.54 — both comfortably above the recalibrated threshold (see `RETRIEVAL_MIN_SIMILARITY` in `.env.example`), while off-topic queries top out around ~0.20. |
 | **Vector store** | Hand-rolled `NumpyFlatIndex` (float32, exact) | At a personal-scale corpus (thousands of chunks), brute-force cosine similarity is *not* a shortcut — it's the technically correct choice: exact (no ANN recall loss), and every line of the math (normalize once, one dot product, `argpartition` top-k) is something explainable end to end, instead of a Chroma/FAISS/Qdrant call that hides it. |
@@ -117,8 +123,10 @@ order to mean "this is next"; every time it looks for work it queries
 concurrent requests racing to start don't guarantee whichever wins the
 race is the one that was actually asked first — deriving order fresh from
 durable state every time removes that race entirely. `Message` gained a
-`status` column (`QUEUED → RETRIEVING → GENERATING → DONE`/`ERROR`,
-mirroring `DocumentStatus`'s existing pattern) so a page load can show
+`status` column (`QUEUED → PROCESSING_DOCUMENTS → RETRIEVING → GENERATING
+→ DONE`/`ERROR` — PROCESSING_DOCUMENTS only when the job is blocked on a
+still-ingesting attached document, mirroring `DocumentStatus`'s existing
+pattern) so a page load can show
 *and reattach to* an in-progress generation instead of showing nothing.
 
 Live-watching reuses a single nullable "current session" slot plus an
@@ -155,6 +163,44 @@ being resumed or left spinning forever. Note `make run` uses `--reload`,
 so this path runs on every file save during development, not just a rare
 production crash.
 
+**Ingestion gets the identical treatment, via a second, independent
+worker.** `IngestionWorker` (`src/ingestion/worker.py`) runs the
+extract→chunk→embed→index pipeline as its own long-lived background task,
+polling `get_oldest_pending_document()` (unscoped by conversation, same
+reasoning as the message-side query) rather than being triggered by, or
+sharing a queue with, any specific request or `GenerationWorker` job. This
+replaced an earlier design where ingestion ran inline in the request that
+uploaded the file, with `GenerationWorker` re-running it as a fallback if
+that got interrupted — which meant a slow LLM generation in one
+conversation could fully block another conversation's stuck-document
+recovery, since both were forced through `GenerationWorker`'s single
+message-at-a-time queue even though embedding and LLM inference use
+separate locks (`LockedEmbedder`/`LockedLLMDriver`, `src/concurrency.py`)
+and never actually contend for the same resource. Confirmed live: a
+document interrupted mid-embed in one conversation now reaches `INDEXED`
+while a *different* conversation's message is still `GENERATING`, not
+after (`tests/test_ingestion_worker.py`) — an embedding only ever waits
+for a prior embedding, never for an unrelated LLM call. `recover_from_crash()`
+mirrors the message-side logic exactly: `UPLOADING` documents (no side
+effects yet) are left for the poll loop to pick up, documents genuinely
+mid-pipeline (`EXTRACTING`/`CHUNKING`/`EMBEDDING`) are marked `ERROR`.
+
+`GenerationWorker` still gates retrieval on this conversation's documents
+all being terminal (`_wait_for_documents_ready`) — that's a genuine
+correctness requirement, not ingestion work — but it does no embedding
+itself and reports nothing to any watcher. Document-status *reporting* to
+the frontend is a third, independent piece: `routes_messages.py`'s
+`_watch_documents` polls `Document` rows directly and `_stream_watch`
+merges that with `GenerationWorker.watch()` via `merge_async_iterators`
+(`src/api/sse.py`), so a conversation's Sources panel keeps updating live
+regardless of what either worker is doing for some other conversation.
+Giving `GenerationWorker` itself the reporting job (the simpler-looking
+first design) would have re-coupled the *frontend's visibility* of
+ingestion progress to `GenerationWorker`'s queue even after decoupling
+the actual work — a conversation's Sources panel would still freeze while
+some other chat was mid-generation. See CLAUDE.md's "Rule #1" for why
+that distinction is treated as a hard rule, not a nice-to-have.
+
 ## Proving "air-gapped," not just claiming it
 
 Every test in the suite runs under `pytest-socket`
@@ -180,8 +226,8 @@ to a dedicated machine, and what stays exactly the same:
 | **Model size / quality** | Qwen3-8B, Q6_K, 8k–16k context (`config.py`'s `standard`/`large` tiers) | A 32B+/70B-class model, Q6_K/Q8_0, 32k+ context | Nothing but the `MEMORY_TIER`/model-path env vars — `config.py`'s tier ladder already has a `server` tier documenting exactly this, and `LLMDriver` never changes. |
 | **Vector search** | Hand-rolled flat NumPy index, exact, sub-millisecond at thousands of chunks | An ANN index (Qdrant, LanceDB) once a corpus genuinely exceeds ~500K–1M vectors on one machine, or once concurrent writers/rich metadata filtering are needed | Implement one more `VectorIndex` (same `add`/`search`/`save` interface, `src/vectorstore/base.py`) — `IndexManager` and everything above it is unaffected. |
 | **Storage** | SQLite, one file, one local user | Postgres, concurrent multi-user access | `src/db/repository.py` is the *only* module that speaks SQL — swapping the connection layer underneath it (and the schema's SQL dialect) doesn't touch `rag/engine.py`, `api/routes_*.py`, or anything else. |
-| **Ingestion concurrency** | One file processed inline per request, in-process | A background job queue (Celery/arq) so uploads don't block a request thread under real concurrent load | `IngestionPipeline.ingest()` already yields discrete status events — wiring those into a job queue instead of a direct async generator is a dispatch change, not a rewrite of the extract→chunk→embed→index logic itself. |
-| **Concurrency control** | A single `asyncio.Lock` in `IndexManager`, plus one shared `asyncio.Lock` serializing all embedder/LLM calls (`src/concurrency.py`) — both fine for one user, one process | Per-conversation locks; a real message broker (Redis pub/sub, or similar) once generation needs to run across multiple server processes, not just one | Same interfaces, finer-grained locking. `GenerationWorker`'s in-memory "current session" state is an explicit single-process constraint (documented in its own module) — a multi-process version needs the queue-claim step (`get_oldest_queued_message` → mark `RETRIEVING`) to become a single atomic conditional `UPDATE`, guarding against two workers claiming the same row. |
+| **Ingestion concurrency** | `IngestionWorker`: a background job queue, in-process, one document at a time (see "Resilient, queued message generation" above) | A real distributed job queue (Celery/arq) once ingestion needs to run across multiple server processes, not just one | `IngestionPipeline.process_existing()` already yields discrete status events and takes an already-created `Document` row — wiring those into a distributed queue instead of an in-process one is a dispatch change, not a rewrite of the extract→chunk→embed→index logic itself. |
+| **Concurrency control** | A single `asyncio.Lock` in `IndexManager`, plus one `asyncio.Lock` *each* for the embedder and the LLM driver (`src/concurrency.py`, deliberately separate — a shared lock would block embedding for the length of an entire LLM generation) — all fine for one user, one process | Per-conversation locks; a real message broker (Redis pub/sub, or similar) once generation needs to run across multiple server processes, not just one | Same interfaces, finer-grained locking. Both workers' in-memory state (`GenerationWorker`'s "current session," `IngestionWorker`'s idle-unload tracking) is an explicit single-process constraint (documented in each module) — a multi-process version needs both workers' queue-claim steps (`get_oldest_queued_message`/`get_oldest_pending_document` → mark in-progress) to become a single atomic conditional `UPDATE` each, guarding against two workers claiming the same row. |
 | **Audio/video** | `AudioVideoIngestor` is a clean, documented stub | Real transcription (`faster-whisper`, lazily loaded, memory-purged after use — see below) | Implement `extract()` on `AudioVideoIngestor`. Chunking, embedding, indexing, and citations (`TimeRef` already exists in `src/models.py`) require zero changes — this is the whole reason the `Ingestor` protocol exists. |
 
 The throughline: every one of these is a **named interface with exactly
@@ -258,20 +304,20 @@ Being explicit about scope, not just implicit through omission:
 - **BM25/keyword search fused with vector search** (Reciprocal Rank
   Fusion) — cheap to add, catches exact-term/acronym queries embeddings
   miss, deferred to keep v1's surface area focused.
-- **File ingestion doesn't have the same disconnect-resilience as message
-  generation.** `IngestionPipeline` still runs inline in the request that
-  uploaded the file — a refresh mid-upload doesn't lose already-persisted
-  chunks (each phase writes to the DB as it completes, same as before),
-  but it does leave a document stuck mid-status with nothing left to
-  finish it, the same class of gap `GenerationWorker` was built to close
-  for messages. The identical pattern (durable queue, background worker,
-  reattachable watch) would generalize directly; not done here since it
-  wasn't the reported problem.
-- **A second, separate pre-existing race, found but not fixed**:
-  `IngestionPipeline.ingest()`'s `index.add(...)` mutates the shared
-  `NumpyFlatIndex` entirely outside `IndexManager`'s lock (only `.get()`/
-  `.save()` take it) — two concurrent uploads to the same conversation
-  could still race on that mutation today.
+- **A pre-existing race, found but not fixed**:
+  `IngestionPipeline.process_existing()`'s `index.add(...)` mutates the
+  shared `NumpyFlatIndex` entirely outside `IndexManager`'s lock (only
+  `.get()`/`.save()` take it) — a retrieval racing an `add()` for the same
+  conversation could still miss a chunk that's mid-write today. Since
+  `IngestionWorker` (see "Resilient, queued message generation" below)
+  made ingestion a continuously-running background process rather than
+  something only triggered by an actual concurrent request, this window
+  is more reachable in practice than it used to be — though the failure
+  mode is unchanged (nondeterministic citation completeness, not
+  corruption or a crash: neither `add()` nor `search()` awaits mid-call,
+  so asyncio's cooperative scheduling can't tear the array itself). Fixing
+  this properly means adding locking inside `VectorIndex` implementations,
+  not just around `IndexManager`'s own bookkeeping.
 - **A labeled grounding eval set** (30-50 questions across
   answerable/unanswerable/adversarial-injection categories, asserting
   refusal-rate and citation-precision as a CI-enforced regression test) —

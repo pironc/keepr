@@ -14,6 +14,7 @@ dependencies = [
     "numpy>=2.1",
     "psutil>=6.0",
     "pypdf>=5.0",
+    "huggingface_hub>=0.24",
 ]
 
 [project.optional-dependencies]
@@ -28,9 +29,6 @@ dev = [
     "types-psutil>=6.0",
     "mypy>=1.13",
     "ruff>=0.7",
-]
-models = [
-    "huggingface_hub>=0.24",
 ]
 
 [build-system]
@@ -54,15 +52,7 @@ warn_unused_configs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = "aiosqlite.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = "llama_cpp.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "pypdf.*"
 ignore_missing_imports = true
 
 [tool.ruff]

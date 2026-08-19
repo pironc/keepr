@@ -15,9 +15,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="Licencia"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=flat-square" alt="Estrellas"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=orange" alt="Issues"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=social" alt="GitHub stars" data-canonical-src="https://img.shields.io/github/stars/pironc/keepr?style=social" style="max-width: 100%;"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="Licencia"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/100%25-Local-FF6600" alt="100% Local"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=blue" alt="Issues"></a>
+</p>
+
+<p align="center"><em>Downloads</em></p>
+<p align="center">
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-aarch64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;ARM</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-x86_64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;x86</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-linux-x86_64.AppImage" title="Linux" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/linux.svg" width="15" height="15" style="display:block;" alt="Linux"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-windows-x86_64-setup.exe" title="Windows" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/windows.svg" width="15" height="15" style="display:block;" alt="Windows"></a>
 </p>
 
 # keepr
@@ -42,7 +51,7 @@ La mayoría de las herramientas RAG envían tus documentos a una API en la nube 
 ### 🔒 Privacidad y funcionamiento sin conexión
 - **Completamente local por defecto.** `LLM_DRIVER=mock` / `EMBEDDER=mock` (los valores predeterminados) ejecutan todo el proceso de ingesta → recuperación → citas sin necesidad de descargar modelos — comprobable en milisegundos.
 - **Modelos locales reales** mediante `llama-cpp-python` (formato GGUF) en Metal (Apple Silicon), CUDA o CPU.
-- **Aislado de la red por diseño.** El frontend está escrito a mano en HTML/CSS/JS vanilla sin dependencias externas — sin etiquetas script de CDN, sin paso de compilación npm. Las fuentes tipográficas están almacenadas localmente como archivos `.woff2`; los iconos son SVGs en línea creados a mano.
+- **Aislado de la red por diseño.** El frontend está escrito a mano en HTML/CSS/JS vanilla sin dependencias externas — sin etiquetas script de CDN, sin paso de compilación npm. Las fuentes tipográficas están almacenadas localmente como archivos `.woff2`; los iconos están creados a mano / almacenados localmente como archivos `.svg` (sin CDN de iconos).
 - **Aislamiento de red comprobado.** Toda la suite de pruebas se ejecuta con `pytest-socket` bloqueando todo acceso real a la red, incluyendo una prueba de control positivo que demuestra que el bloqueo está realmente activo.
 
 ### 📄 Chat RAG con anti-alucinación determinista
@@ -60,11 +69,17 @@ La mayoría de las herramientas RAG envían tus documentos a una API en la nube 
 - Un archivo se prepara al soltarlo y se procesa en el momento en que pulsas enviar: **extraer → fragmentar → incrustar → indexar**.
 - Una animación de estado por archivo (`staged → extracting → chunking → embedding → indexed`) se controla mediante eventos SSE reales del backend, no por un temporizador falso.
 - Cada tipo de archivo pasa por el mismo pipeline — el protocolo `Ingestor` es lo que hace que el soporte de audio/vídeo sea ampliable más adelante sin tocar nada posterior en la cadena.
+- Se ejecuta como su propia tarea en segundo plano (`IngestionWorker`), independiente de tu conexión HTTP — cerrar la pestaña o perder la red a mitad de una subida no pausa ni pierde el trabajo de extraer→fragmentar→incrustar→indexar en curso; volver a abrir la conversación se reconecta a él en vivo.
 
 ### 🔄 Generación duradera e independiente de la conexión
-- En el momento en que pulsas enviar, la generación del mensaje se ejecuta como una **tarea en segundo plano** independiente de tu conexión HTTP.
+- En el momento en que pulsas enviar, la generación del mensaje se ejecuta como una **tarea en segundo plano** (`GenerationWorker`) independiente de tu conexión HTTP, en su propia cola separada de la ingesta — una incrustación solo espera a una incrustación anterior, nunca a una generación de LLM no relacionada.
 - Recarga la página a mitad de una respuesta — la respuesta sigue generándose y se guarda en la base de datos de todos modos. Al recargar, te reconectas a ella en vivo, esté donde esté.
-- Recuperación ante fallos: al iniciar, cualquier mensaje atascado a mitad de generación por una muerte anterior del proceso se marca como erróneo con su contenido parcial preservado, en lugar de quedarse girando para siempre.
+- Recuperación ante fallos: al iniciar, cualquier mensaje o documento atascado a mitad de proceso por una muerte anterior del proceso se marca como erróneo con su contenido parcial preservado, en lugar de quedarse girando para siempre.
+
+### ⚙️ Gestión de modelos integrada
+- El menú de Ajustes lista cada `.gguf` en `models/`, clasificado como modelo de LLM o de incrustación a partir de sus propios metadatos (una clave de capa de pooling), nunca por el nombre del archivo — sin lista de nombres de modelo codificada que mantener al día conforme aparecen nuevas arquitecturas.
+- Descarga un modelo directamente desde Ajustes (Hugging Face Hub, con progreso en vivo) en lugar de ejecutar primero un paso de CLI aparte.
+- Cambiar el modelo activo de LLM o de incrustación guarda la elección y reinicia la app para que el nuevo modelo se cargue de verdad; eliminar un archivo de modelo está disponible de la misma forma.
 
 ### 🧱 Arquitectura conectable
 Cada capa está detrás de un protocolo/ABC — intercambia implementaciones sin reestructurar:
@@ -203,7 +218,7 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
     citations: list[Citation]
-    status: MessageStatus  # queued → retrieving → generating → done | error
+    status: MessageStatus  # queued → processing-documents → retrieving → generating → done | error
     created_at: datetime
 ```
 
@@ -230,8 +245,8 @@ Abre [http://localhost:8000](http://localhost:8000). Suelta un PDF o un archivo 
 Para inferencia local real, monta tus modelos y cambia los drivers:
 
 ```bash
-# Primero, descarga los modelos GGUF en data/models/ (solo una vez):
-make download-models
+# Primero, descarga los modelos GGUF en models/ (solo una vez):
+python scripts/download_models.py
 
 # Luego sobrescribe las variables de entorno de Compose:
 LLM_DRIVER=llama_cpp EMBEDDER=llama_cpp docker compose up --build
@@ -261,15 +276,16 @@ Copia `.env.example` a `.env` para personalizarlas. Las esenciales:
 | Variable | Propósito |
 |---|---|
 | `LLM_DRIVER` | `mock` (por defecto, sin descarga) o `llama_cpp` (inferencia GGUF local real). |
-| `LLM_MODEL_PATH` | Ruta al archivo GGUF. Solo cuando `LLM_DRIVER=llama_cpp`. |
+| `LLM_MODEL_PATH` | Ruta al archivo GGUF. Solo cuando `LLM_DRIVER=llama_cpp`. Déjalo sin configurar para usar el modelo elegido en el menú de Ajustes. |
 | `LLM_CONTEXT_WINDOW` | Tamaño de la ventana de contexto (por defecto se detecta automáticamente desde `MEMORY_TIER`, típicamente `8192`). |
 | `LLM_GPU_LAYERS` | Capas a descargar en la GPU (`-1` = todas, por defecto). |
 | `EMBEDDER` | `mock` (por defecto) o `llama_cpp`. |
-| `EMBEDDING_MODEL_PATH` | Ruta al modelo GGUF de incrustación. Solo cuando `EMBEDDER=llama_cpp`. |
+| `EMBEDDING_MODEL_PATH` | Ruta al modelo GGUF de incrustación. Solo cuando `EMBEDDER=llama_cpp`. Déjalo sin configurar para usar el modelo elegido en el menú de Ajustes. |
 | `EMBEDDING_GPU_LAYERS` | Capas de GPU para incrustación (por defecto `0` — la incrustación se ejecuta en CPU para evitar contención de GPU con el LLM). |
 | `VECTOR_INDEX_BACKEND` | `flat` (float32, exacto) o `quantized` (cuantización escalar int8, ~4× menos memoria). |
 | `RETRIEVAL_TOP_K` | Número de fragmentos a recuperar por consulta (por defecto `5`). |
 | `RETRIEVAL_MIN_SIMILARITY` | Umbral de similitud coseno por debajo del cual el motor se niega a responder (por defecto `0.22` — calibrado para nomic-embed-text-v2-moe). |
+| `MODELS_DIR` | Directorio donde se buscan los archivos de modelo `.gguf` (por defecto `models`). |
 | `DATABASE_PATH` | Ruta de la base de datos SQLite (por defecto `data/keepr.db`). |
 | `INDEX_DIR` | Directorio de índices vectoriales por conversación (por defecto `data/index`). |
 | `UPLOAD_DIR` | Almacenamiento de archivos subidos (por defecto `data/uploads`). |
@@ -280,8 +296,16 @@ Copia `.env.example` a `.env` para personalizarlas. Las esenciales:
 
 ### Ejecución con modelos locales reales
 
+Instala el driver `llama_cpp` — un extra aparte, más pesado (compila `llama-cpp-python` desde el código fuente; en Apple Silicon activa la aceleración Metal automáticamente, sin flags adicionales):
+
 ```bash
-make download-models   # descarga el par Qwen3-8B + nomic-embed-text-v2-moe GGUF (~7.5 GB en total)
+pip install -e ".[llama]"
+```
+
+Luego descarga el par Qwen3-8B + nomic-embed-text-v2-moe GGUF (~7.5 GB en total) desde el menú de **Ajustes** de la app, o desde la CLI:
+
+```bash
+python scripts/download_models.py
 ```
 
 Luego en `.env`:
@@ -292,6 +316,8 @@ EMBEDDER=llama_cpp
 ```
 
 Reinicia `make run`. El primer mensaje será más lento (carga del modelo en memoria); todo lo posterior se ejecuta desde el stack residente ya caliente.
+
+Para usar un modelo distinto, coloca cualquier GGUF compatible con llama.cpp en `models/` y elígelo en el menú de **Ajustes** — la elección se guarda y se aplica en el próximo reinicio. También puedes definir `LLM_MODEL_PATH` / `EMBEDDING_MODEL_PATH` directamente para anularlo. (El modelo de incrustación no es tan libre de cambiar: `RETRIEVAL_MIN_SIMILARITY` está calibrado para nomic-embed-text-v2-moe, así que cambiarlo implica recalibrar ese umbral.)
 
 ### Aplicación de escritorio nativa (macOS)
 
@@ -320,11 +346,15 @@ keepr/
 │   ├── config.py              # Detección de hardware, niveles de memoria, Settings
 │   ├── concurrency.py         # Wrappers LockedEmbedder / LockedLLMDriver
 │   ├── logger.py              # Registro estructurado
+│   ├── download.py            # Helpers de descarga de modelos (Hugging Face Hub, compartidos con la CLI)
+│   ├── gguf_meta.py           # Clasificador ligero de metadatos GGUF (detección de pooling)
+│   ├── model_unavailable.py   # ModelUnavailableError — archivo GGUF ausente/roto, por rol
 │   ├── api/
 │   │   ├── app.py             # Fábrica de la app FastAPI + lifespan
 │   │   ├── context.py         # AppContext + DI
 │   │   ├── routes_conversations.py
 │   │   ├── routes_messages.py # Endpoint SSE multiplexado
+│   │   ├── routes_models.py   # Endpoints de estado/selección/descarga de modelos
 │   │   └── sse.py             # Helpers de formato SSE
 │   ├── db/
 │   │   ├── pool.py            # SQLiteConnectionPool
@@ -338,6 +368,7 @@ keepr/
 │   ├── ingestion/
 │   │   ├── base.py            # Protocolo Ingestor
 │   │   ├── pipeline.py        # Orquesta extraer→fragmentar→incrustar→indexar
+│   │   ├── worker.py          # Tarea en segundo plano — duradera, independiente de la conexión
 │   │   ├── chunker.py         # Fragmentación de texto con solapamiento
 │   │   ├── registry.py        # Encuentra el ingestor adecuado para un archivo
 │   │   ├── pdf_ingestor.py
@@ -373,9 +404,11 @@ keepr/
 │   ├── src/lib.rs
 │   └── binaries/              # Binario del backend compilado con PyInstaller
 ├── tests/                     # pytest + pytest-asyncio + pytest-socket
+├── models/                    # Pesos de modelos .gguf descargados (MODELS_DIR)
 ├── scripts/
-│   └── download_models.py     # Descargador único de modelos GGUF (el único script que toca la red)
+│   └── download_models.py     # Descargador único de modelos GGUF (script de red exento de tests)
 ├── assets/                    # Logo, capturas de pantalla
+│   └── icons/                 # Iconos de marca blancos para los botones de descarga
 ├── ARCHITECTURE.md            # Diseño técnico completo e historia de escalado
 ├── CLAUDE.md                  # Guía para asistentes AI / contribuidores
 ├── Makefile
@@ -389,13 +422,14 @@ keepr/
 ```bash
 make install          # pip install -e ".[dev]"
 make run              # uvicorn src.api.app:app --reload --port 8000
-make download-models  # descargar modelos GGUF (el único paso que toca la red)
 make test             # pytest
 make lint             # ruff check .
 make typecheck        # mypy --strict
 make ci               # lint + typecheck + test — ejecutar antes de dar nada por terminado
 make clean            # borra DB/índice/subidas (estado de la app) — NO los pesos de los modelos
-make clean-models     # borra también data/models/
+make clean-models     # borra también models/
+make wipe             # reinicio completo a un estado recién clonado (venv, cachés,
+                       # salida de compilación, src-tauri/target, etc.) — models/ sigue exento
 ```
 
 ### Pruebas
@@ -409,6 +443,7 @@ La suite de pruebas se ejecuta con el acceso a la red deshabilitado globalmente 
 Archivos de prueba clave:
 - `tests/test_rag_engine.py` — rechazo por umbral, verificación de citas (incluyendo un driver que deliberadamente inventa una cita)
 - `tests/test_generation_worker.py` — generación independiente de la conexión, recuperación ante fallos, reconexión del observador
+- `tests/test_ingestion_worker.py` — ingesta independiente de la conexión, recuperación ante fallos, temporización de descarga por inactividad
 - `tests/test_ingestion_pipeline.py` — deduplicación por hash de contenido, transiciones de estado
 - `tests/test_vectorstore.py` — benchmarks de ratio de memoria de cuantización y concordancia top-1
 - `tests/test_airgapped.py` — control positivo que demuestra que el bloqueo de sockets está activo
@@ -453,7 +488,6 @@ Siendo explícitos sobre el alcance:
 - **Transcripción real de audio/vídeo.** `AudioVideoIngestor.extract()` lanza `UnsupportedSourceError` hoy. El plan: `faster-whisper`, carga diferida, memoria liberada tras su uso.
 - **Truncamiento/resumen del historial de conversación.** Las conversaciones largas actualmente envían el historial completo al modelo en cada turno.
 - **Búsqueda BM25/palabras clave fusionada con búsqueda vectorial** (Reciprocal Rank Fusion) — barato de añadir, captura consultas de términos exactos que las incrustaciones pasan por alto.
-- **Resiliencia ante desconexión en la ingesta de archivos.** La ingesta se ejecuta en línea dentro de la petición; una recarga a mitad de la subida deja un documento atascado en un estado intermedio (aunque los fragmentos ya persistidos sobreviven). El patrón idéntico que `GenerationWorker` usó para los mensajes se generalizaría directamente.
 - **Un conjunto de evaluación de fundamentación etiquetado** (30-50 preguntas en categorías respondibles/no respondibles/adversariales, aplicado en CI) — el mecanismo está probado; un sistema estadístico más amplio es el siguiente paso natural.
 
 ---

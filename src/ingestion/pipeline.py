@@ -19,6 +19,7 @@ from src.ingestion.base import UnsupportedSourceError
 from src.ingestion.chunker import chunk_segments
 from src.ingestion.registry import find_ingestor
 from src.logger import get_logger
+from src.model_unavailable import ModelUnavailableError
 from src.models import Chunk, Document, DocumentStatus, SourceKind
 from src.vectorstore.base import VectorIndex
 
@@ -51,70 +52,38 @@ class IngestionPipeline:
         self._repository = repository
         self._embedder = embedder
         self._settings = settings
-        # Serialise ingestion per conversation — the SSE generator in
-        # routes_messages.py and the GenerationWorker's
-        # _ensure_documents_indexed both call ingest() for the same
-        # document concurrently, which races through every DB operation
-        # and creates duplicate chunks in the index.  A per-conversation
-        # lock ensures the worker's call waits for the SSE generator to
-        # finish, finds the document already INDEXED, and returns
-        # immediately instead of re-running the full pipeline.
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
+        # Guards create_stub's body only (a SELECT + conditional INSERT +
+        # one file write — sub-millisecond) against two near-simultaneous
+        # uploads of identical content (e.g. two browser tabs) racing the
+        # content-hash dedup check into duplicate rows. The heavier
+        # extract->chunk->embed->index pipeline (process_existing) has
+        # exactly one caller app-wide (IngestionWorker, one document at a
+        # time) and needs no lock of its own.
+        self._create_stub_lock = asyncio.Lock()
 
-    async def _get_lock(self, conversation_id: str) -> asyncio.Lock:
-        async with self._locks_guard:
-            if conversation_id not in self._locks:
-                self._locks[conversation_id] = asyncio.Lock()
-            return self._locks[conversation_id]
-
-    async def ingest(
+    async def create_stub(
         self,
         conversation_id: str,
         filename: str,
-        mime_type: str,
         content: bytes,
-        index: VectorIndex,
-    ) -> AsyncIterator[DocumentStatusEvent]:
-        # Only one ingest() call per conversation at a time.  The
-        # GenerationWorker's _ensure_documents_indexed fallback races
-        # with the SSE generator's primary ingestion path — this lock
-        # makes the worker wait until the SSE generator finishes, at
-        # which point the content-hash check below finds the document
-        # already INDEXED and returns immediately without re-running
-        # the full pipeline.
-        async with await self._get_lock(conversation_id):
-            async for event in self._ingest(
-                conversation_id, filename, mime_type, content, index
-            ):
-                yield event
+    ) -> Document:
+        """Fast, side-effect-light: dedup by content hash, then create-or-
+        reuse the Document row and write bytes to disk. Does NOT run
+        extraction/chunking/embedding — that's process_existing's job,
+        called exclusively by IngestionWorker. Safe to call from a plain
+        (non-streaming) request handler even under a client disconnect.
+        """
+        async with self._create_stub_lock:
+            content_hash = hashlib.sha256(content).hexdigest()
+            existing = await self._repository.get_document_by_content_hash(conversation_id, content_hash)
+            if existing is not None:
+                # Already indexed (e.g. re-dropped on a later message) or
+                # still mid-pipeline from an earlier interrupted attempt —
+                # either way, reuse this row rather than inserting a
+                # duplicate, which would double every one of its chunks in
+                # the index once processed.
+                return existing
 
-    async def _ingest(
-        self,
-        conversation_id: str,
-        filename: str,
-        mime_type: str,
-        content: bytes,
-        index: VectorIndex,
-    ) -> AsyncIterator[DocumentStatusEvent]:
-        content_hash = hashlib.sha256(content).hexdigest()
-        existing = await self._repository.get_document_by_content_hash(conversation_id, content_hash)
-        if existing is not None and existing.status == DocumentStatus.INDEXED:
-            # This exact file is already indexed in this conversation (e.g.
-            # re-dropped on a later message) — re-ingesting would duplicate
-            # every one of its chunks in the index. Report it as already
-            # done instead of silently doing the work twice.
-            yield DocumentStatusEvent(existing.id, DocumentStatus.UPLOADING)
-            yield DocumentStatusEvent(existing.id, DocumentStatus.INDEXED)
-            return
-
-        # If a document stub was already created (e.g. by the SSE generator
-        # or a previous interrupted ingestion attempt), reuse it instead of
-        # inserting a duplicate row — otherwise the same file ends up with
-        # two sets of chunks in the index.
-        if existing is not None:
-            document = existing
-        else:
             document = Document(
                 id=str(uuid.uuid4()),
                 conversation_id=conversation_id,
@@ -124,17 +93,49 @@ class IngestionPipeline:
                 status=DocumentStatus.UPLOADING,
             )
             await self._repository.create_document(document)
+            path = self._settings.upload_dir / f"{document.id}_{filename}"
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_bytes, content)
+            return document
+
+    async def process_existing(
+        self,
+        document: Document,
+        index: VectorIndex,
+    ) -> AsyncIterator[DocumentStatusEvent]:
+        """Runs extract -> chunk -> embed -> index for a Document row that
+        already exists (created via create_stub, bytes already on disk).
+        Called exclusively by IngestionWorker — one document at a time,
+        app-wide."""
         yield DocumentStatusEvent(document.id, DocumentStatus.UPLOADING)
 
-        ingestor = find_ingestor(filename, mime_type)
-        if ingestor is None:
-            async for event in self._fail(document.id, DocumentStatus.UNSUPPORTED, f"Unsupported file type: {filename}"):
+        path = self._settings.upload_dir / f"{document.id}_{document.filename}"
+        if not await asyncio.to_thread(path.exists):
+            # The conversation's document row exists but its bytes don't —
+            # e.g. deleted from disk, or create_stub's own write was
+            # interrupted before this document ever got here. A plain
+            # FileNotFoundError from ingestor.extract() below would still be
+            # caught by the generic except-Exception further down, but with
+            # a much less actionable message than this one.
+            async for event in self._fail(
+                document.id, DocumentStatus.ERROR,
+                "File not found on disk — may have been deleted or the upload was interrupted.",
+            ):
                 yield event
             return
 
-        path = self._settings.upload_dir / f"{document.id}_{filename}"
-        await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(path.write_bytes, content)
+        # mime_type is never load-bearing here: every Ingestor.supports()
+        # checks the filename extension first, falling back to mime_type
+        # only for extension-less names, and _source_kind_for (used at
+        # create_stub time, above) is filename-only too. A fixed value
+        # matches what re-ingestion from disk has always used.
+        ingestor = find_ingestor(document.filename, "application/octet-stream")
+        if ingestor is None:
+            async for event in self._fail(
+                document.id, DocumentStatus.UNSUPPORTED, f"Unsupported file type: {document.filename}"
+            ):
+                yield event
+            return
 
         await self._repository.update_document_status(document.id, DocumentStatus.EXTRACTING)
         yield DocumentStatusEvent(document.id, DocumentStatus.EXTRACTING)
@@ -164,7 +165,7 @@ class IngestionPipeline:
             Chunk(
                 id=str(uuid.uuid4()),
                 document_id=document.id,
-                conversation_id=conversation_id,
+                conversation_id=document.conversation_id,
                 text=segment.text,
                 source_ref=segment.source_ref,
                 chunk_index=chunk_index,
@@ -174,7 +175,24 @@ class IngestionPipeline:
 
         await self._repository.update_document_status(document.id, DocumentStatus.EMBEDDING)
         yield DocumentStatusEvent(document.id, DocumentStatus.EMBEDDING)
-        vectors = await self._embedder.embed_documents([chunk.text for chunk in chunks])
+        try:
+            vectors = await self._embedder.embed_documents([chunk.text for chunk in chunks])
+        except ModelUnavailableError as exc:
+            # Embedding model missing or unloadable — this is a "your model is
+            # broken" condition, not a per-file problem. Catch it here (rather
+            # than letting it escape) so neither the SSE generator nor the
+            # GenerationWorker crashes on it; a raw llama-cpp ValueError would
+            # otherwise surface as a generic "Something went wrong" with no
+            # hint about the model. Chained `error_message` is what the UI
+            # shows on the failed source.
+            async for event in self._fail(document.id, DocumentStatus.ERROR, str(exc)):
+                yield event
+            return
+        except Exception as exc:  # any other embedding failure, keep contained
+            logger.warning("embedding failed for document %s: %s", document.id, exc)
+            async for event in self._fail(document.id, DocumentStatus.ERROR, str(exc)):
+                yield event
+            return
 
         await self._repository.create_chunks(chunks)
         index.add([chunk.id for chunk in chunks], vectors)

@@ -65,4 +65,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     # one worker, one queue, app-wide) — not scoped to a single
     # conversation_id, so it needs its own index rather than reusing the one above.
     "CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)",
+    # Same reasoning as idx_messages_status: IngestionWorker queries across
+    # ALL conversations by status (one worker, one queue, app-wide).
+    "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)",
 )

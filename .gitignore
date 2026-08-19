@@ -16,6 +16,8 @@ __pycache__/
 venv/
 .env
 data/
+models/*
+!models/.gitkeep
 outputs/
 .mypy_cache/
 .ruff_cache/

@@ -1,48 +1,51 @@
 """POST /conversations/{id}/messages — accepts a prompt plus optional file
 attachments, and streams back a single multiplexed SSE response:
 document_status events (drives the UI's per-file processing animation)
-for any newly attached files, then message_status/token/citations/done
+for any file in the conversation, then message_status/token/citations/done
 events for the assistant turn, optionally followed by one conversation_title
 event if this was the conversation's first exchange (see GenerationWorker
 ._maybe_title_conversation — it deliberately arrives before the stream
 closes, not after, so the sender's own connection is still open to see it).
 
-The assistant placeholder is enqueued BEFORE file ingestion runs, so that
-even if the client disconnects mid-ingestion (page refresh, navigation)
-the QUEUED row already exists and GenerationWorker will pick it up.  Its
-_ensure_documents_indexed fallback then finishes any document that never
-reached INDEXED — the pipeline's content-hash dedup prevents re-creating
-the document row, and the worker re-runs the full pipeline from the saved
-file bytes.  This is what prevents the "Embedding… forever" bug when a
-user sends a file and leaves before ingestion completes.
+Per CLAUDE.md's Rule #1, this module does no computation of its own — it
+only persists the fast, side-effect-light setup (the user's message, a
+Document stub per uploaded file, the assistant placeholder) and then
+watches durable backend state. All of it happens in the plain
+`post_message` handler, BEFORE any StreamingResponse is constructed:
+Starlette's disconnect-driven cancellation only exists inside
+StreamingResponse's own body iterator, so a plain awaited handler runs to
+completion regardless of an early client disconnect.
 
-File ingestion runs in this SSE generator (the primary path) so that
-documents go through the full pipeline immediately — even while another
-chat is mid-generation.  This is safe because the embedder and LLM driver
-are protected by separate asyncio.Lock instances (LockedEmbedder vs
-LockedLLMDriver in src/concurrency.py): embedding for Chat B's newly
-dropped file does not compete with Chat A's LLM inference, and the SQLite
-busy_timeout absorbs concurrent writes from the two paths.
-
-Generation itself runs on GenerationWorker, independent of this specific
-HTTP connection's lifetime — this route only subscribes to it via
-watch(). If the client disconnects mid-generation, only this subscriber
-dies; the worker keeps running and keeps persisting to the DB regardless.
+Document ingestion (extract->chunk->embed->index) is entirely
+IngestionWorker's job (src/ingestion/worker.py), on its own queue,
+independent of GenerationWorker's — an embedding only ever waits for a
+prior embedding, never for an unrelated LLM generation (src/concurrency.py
+gives them separate locks). This route just watches: `_watch_documents`
+polls Document rows directly (live for any document in the conversation,
+regardless of which message attached it) and `_stream_watch` merges that
+with GenerationWorker.watch()'s message events via
+`merge_async_iterators`, so neither stream blocks the other. This runs
+identically for a brand-new send and for a reconnect (GET
+.../messages/{id}/stream) — losing this specific HTTP connection only
+ever drops a *viewer* of backend state, never the state itself.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from src.api.context import AppContext, get_context
-from src.api.sse import format_event
+from src.api.sse import format_event, merge_async_iterators
+from src.db.repository import Repository
 from src.ingestion.pipeline import DocumentStatusEvent
 from src.logger import get_logger
-from src.models import Message
+from src.models import DocumentStatus, Message
 from src.rag.engine import MessageStatusEvent as RagMessageStatusEvent
 from src.rag.engine import TokenEvent
 from src.rag.generation_worker import ConversationTitleEvent, WorkerEvent
@@ -52,6 +55,27 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/conversations", tags=["messages"])
 
 
+def _sanitize_upload_filename(filename: str) -> str:
+    """Reduce a client-supplied upload filename to a safe bare basename.
+
+    The filename arrives untrusted: a crafted multipart form could set it to
+    ``../../evil`` (or a name with raw CR/LF) to escape the upload directory
+    via path traversal on the write path, or to inject bytes into the
+    ``Content-Disposition`` header on the get-document-file route (which
+    interpolates ``document.filename`` into a ``filename="..."`` header).
+
+    ``Path(name).name`` drops any directory components/separators; what
+    remains is then stripped of control characters (CR/LF/tab/NUL/…) and
+    double-quotes, all of which are never part of a legit file name but
+    would break HTTP-header framing or cross filesystem boundaries.
+    """
+    name = Path(filename).name
+    cleaned = "".join(ch for ch in name if ch >= " " and ch != chr(0x7F) and ch != '"')
+    # A fully-hostile name can reduce to empty; fall back so a document row
+    # still exists (the download URL is keyed by document id, never the name).
+    return cleaned or "upload"
+
+
 @router.post("/{conversation_id}/messages")
 async def post_message(
     conversation_id: str,
@@ -59,9 +83,9 @@ async def post_message(
     files: list[UploadFile] = File(default_factory=list),
     context: AppContext = Depends(get_context),
 ) -> StreamingResponse:
-    # Validate before streaming — a stale conversation_id (e.g. the DB was
-    # wiped but the browser still references an old URL) would otherwise
-    # crash mid-stream on the first document INSERT with a FOREIGN KEY error.
+    # Validate before doing anything else — a stale conversation_id (e.g.
+    # the DB was wiped but the browser still references an old URL) would
+    # otherwise fail on the first Document INSERT with a FOREIGN KEY error.
     conversation = await context.repository.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -73,9 +97,38 @@ async def post_message(
     if not prompt_text and files:
         prompt_text = "Summarize the uploaded document."
 
+    # Everything below is a plain awaited handler body, not a streaming
+    # generator — see this module's docstring for why that matters. All of
+    # it runs to completion even if the client disconnects immediately
+    # after this request is sent.
+    user_message = Message(
+        id=str(uuid.uuid4()), conversation_id=conversation_id, role="user", content=prompt_text
+    )
+    await context.repository.create_message(user_message)
+
+    # Filenames are client-supplied, so reduce each one to a bare basename
+    # and strip CR/LF/control characters before it reaches the filesystem
+    # (`upload_dir / "{doc_id}_{filename}"`) and the `Content-Disposition`
+    # header on the download route — otherwise a crafted name could walk up
+    # the upload dir (via `..`) or inject extra header bytes on the
+    # get-document-file response. This mirrors the bare-basename-only
+    # validation already applied to model selection in routes_models.py.
+    # Read each upload's content upfront — Starlette's UploadFile is
+    # spooled and may be cleaned up once this handler returns.
+    for upload in files:
+        content = await upload.read()
+        filename = _sanitize_upload_filename(upload.filename or "upload")
+        await context.pipeline.create_stub(conversation_id, filename, content)
+
+    # Enqueued last: by the time IngestionWorker or GenerationWorker ever
+    # look at this conversation, every Document stub above already exists.
+    message_id = await context.generation_worker.enqueue_new(conversation_id)
+
+    logger.info(
+        "sse_send_start conversation=%s message=%s files=%d", conversation_id, message_id, len(files)
+    )
     return StreamingResponse(
-        _stream_new_message(conversation_id, prompt_text, files, context),
-        media_type="text/event-stream",
+        _stream_watch(conversation_id, message_id, context), media_type="text/event-stream"
     )
 
 
@@ -91,98 +144,53 @@ async def stream_message(
     if message is None or message.conversation_id != conversation_id:
         raise HTTPException(status_code=404, detail="Message not found in this conversation")
     return StreamingResponse(
-        _stream_watch(message_id, context), media_type="text/event-stream"
+        _stream_watch(conversation_id, message_id, context), media_type="text/event-stream"
     )
 
 
-async def _stream_new_message(
-    conversation_id: str,
-    prompt: str,
-    files: list[UploadFile],
-    context: AppContext,
-) -> AsyncIterator[str]:
-    logger.info("sse_send_start conversation=%s files=%d", conversation_id, len(files))
-
+async def _stream_watch(conversation_id: str, message_id: str, context: AppContext) -> AsyncIterator[str]:
+    """The one streaming body for both a brand-new send and a reconnect —
+    purely a watcher, doing no work of its own. Merges document-status
+    watching (independent of GenerationWorker, see _watch_documents below)
+    with GenerationWorker.watch()'s message events, so neither blocks the
+    other."""
+    logger.info("sse_watch_start conversation=%s message=%s", conversation_id, message_id)
     try:
-        # 1. Persist the user message — even if the client disconnects before
-        #    the first SSE event is sent, the question is already saved.
-        user_message = Message(
-            id=str(uuid.uuid4()), conversation_id=conversation_id, role="user", content=prompt
-        )
-        await context.repository.create_message(user_message)
-
-        # 2. Read all file content upfront (Starlette's UploadFile is spooled
-        #    and may be cleaned up after the request handler returns).
-        file_payloads: list[tuple[str, str, bytes]] = []
-        for upload in files:
-            content = await upload.read()
-            filename = upload.filename or "upload"
-            mime_type = upload.content_type or "application/octet-stream"
-            file_payloads.append((filename, mime_type, content))
-
-        # 3. Enqueue the assistant placeholder BEFORE ingestion.  If the
-        #    client disconnects during the ingestion loop below (page
-        #    refresh, navigation), the QUEUED row already exists and the
-        #    worker will pick it up — its _ensure_documents_indexed fallback
-        #    finishes any document that never reached INDEXED.  If ingestion
-        #    completes first (the common case), the worker's fallback is a
-        #    no-op (documents are already INDEXED).
-        message_id = await context.generation_worker.enqueue_new(conversation_id)
-
-        # 4. Run ingestion NOW — extract, chunk, embed, and index every
-        #    attached file immediately.  This is the primary path, and it
-        #    runs fine even while another conversation's LLM is generating:
-        #    LockedEmbedder and LockedLLMDriver use separate asyncio.Lock
-        #    instances, so embedding for ingestion does NOT compete with
-        #    the other chat's inference.
-        #
-        #    Note: enqueue_new above created a QUEUED row for this
-        #    conversation.  If ingestion takes > 500ms (large file), the
-        #    worker may pick up that QUEUED job while this generator is
-        #    still ingesting.  The worker's _ensure_documents_indexed will
-        #    then find the document still non-INDEXED and attempt to
-        #    re-ingest it concurrently — the pipeline's content-hash dedup
-        #    prevents a duplicate document row, but the two parallel
-        #    ingest() runs can create duplicate chunks in the index.  This
-        #    race window is narrow (ingestion of typical files completes
-        #    within the worker's 500ms poll interval) and the consequence
-        #    is duplicate citations rather than data loss; a future staleness
-        #    check (using document updated_at) would close it entirely.
-        if file_payloads:
-            index = await context.index_manager.get(conversation_id)
-            for filename, mime_type, content in file_payloads:
-                async for status_event in context.pipeline.ingest(
-                    conversation_id, filename, mime_type, content, index
-                ):
-                    yield format_event(
-                        "document_status",
-                        {
-                            "document_id": status_event.document_id,
-                            "status": status_event.status.value,
-                            "error_message": status_event.error_message,
-                        },
-                    )
-            await context.index_manager.save(conversation_id)
-
-        # 5. Watch the worker for RAG retrieval + LLM generation.  Document
-        #    status events may also arrive here (the worker's fallback
-        #    _ensure_documents_indexed) if ingestion was interrupted above.
-        async for event in context.generation_worker.watch(message_id):
+        async for event in merge_async_iterators(
+            _watch_documents(conversation_id, context.repository),
+            context.generation_worker.watch(message_id),
+        ):
             yield _format_rag_event(event)
     finally:
-        logger.info("sse_send_end conversation=%s", conversation_id)
+        logger.info("sse_watch_end conversation=%s message=%s", conversation_id, message_id)
 
 
-async def _stream_watch(message_id: str, context: AppContext) -> AsyncIterator[str]:
-    logger.info("sse_reconnect_start message_id=%s", message_id)
-    try:
-        async for event in context.generation_worker.watch(message_id):
-            yield _format_rag_event(event)
-    finally:
-        logger.info("sse_reconnect_end message_id=%s", message_id)
+async def _watch_documents(conversation_id: str, repository: Repository) -> AsyncIterator[DocumentStatusEvent]:
+    """Poll this conversation's Document rows directly and yield on every
+    status transition, until none are non-terminal. Independent of
+    IngestionWorker (which does the actual work) and of GenerationWorker
+    (which only waits on this same state, never reports it) — this is the
+    sole source of document_status events, live or on reconnect alike, so
+    a conversation's Sources panel never freezes behind some other
+    conversation's LLM generation.
+    """
+    terminal = frozenset({DocumentStatus.INDEXED, DocumentStatus.ERROR, DocumentStatus.UNSUPPORTED})
+    last_seen: dict[str, DocumentStatus] = {}
+    while True:
+        docs = await repository.list_documents(conversation_id)
+        pending = False
+        for doc in docs:
+            if last_seen.get(doc.id) != doc.status:
+                last_seen[doc.id] = doc.status
+                yield DocumentStatusEvent(doc.id, doc.status, doc.error_message)
+            if doc.status not in terminal:
+                pending = True
+        if not pending:
+            return
+        await asyncio.sleep(0.2)
 
 
-def _format_rag_event(event: WorkerEvent) -> str:
+def _format_rag_event(event: WorkerEvent | DocumentStatusEvent) -> str:
     if isinstance(event, TokenEvent):
         return format_event("token", {"text": event.text})
     if isinstance(event, RagMessageStatusEvent):

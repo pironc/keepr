@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.concurrency import LockedEmbedder
 from src.db.repository import Repository
@@ -132,9 +133,9 @@ class _RaisingTitleDriver(LLMDriver):
 
 
 class _RacyEmbedder:
-    """Purpose-built to expose the exact race confirmed by reading
-    llama_cpp's real source (no internal locking, multi-step mutation of
-    instance state) — MockEmbedder is stateless and can never fail this way."""
+    """Purpose-built to expose the race enabled by llama_cpp's real embedder
+    having no internal locking (multi-step mutation of instance state) —
+    MockEmbedder is stateless and can never fail this way."""
 
     def __init__(self) -> None:
         self.dimensions = 4
@@ -145,6 +146,9 @@ class _RacyEmbedder:
 
     async def embed_query(self, text: str) -> np.ndarray:
         return await self._embed_one(text)
+
+    async def availability(self) -> str | None:
+        return None
 
     async def _embed_one(self, text: str) -> np.ndarray:
         self._shared_state = text
@@ -224,18 +228,9 @@ async def _seed_chunk_with_index(
 def _make_worker(
     repository: Repository, embedder: MockEmbedder, driver: LLMDriver, tmp_path: Path
 ) -> GenerationWorker:
-    from unittest.mock import MagicMock
-
     engine = RagEngine(repository=repository, embedder=embedder, top_k=5, min_similarity=0.0)
     index_manager = IndexManager(tmp_path / "index", "flat")
-    # The fallback ingestion path (GenerationWorker._ensure_documents_indexed)
-    # is not exercised by any test in this file — every test explicitly
-    # pre-populates the index before enqueuing.  Pass a mock pipeline so
-    # the constructor is satisfied without real Settings / embedder deps.
-    mock_pipeline = MagicMock()
-    upload_dir = tmp_path / "uploads"
-    upload_dir.mkdir(exist_ok=True)
-    return GenerationWorker(repository, engine, index_manager, driver, mock_pipeline, upload_dir, embedder)
+    return GenerationWorker(repository, engine, index_manager, driver)
 
 
 async def _wait_until_terminal(repository: Repository, message_id: str, timeout_seconds: float = 5.0) -> Message:
@@ -382,6 +377,93 @@ async def test_recover_from_crash_errors_stuck_generation_but_leaves_queued_alon
     assert queued_after.status == MessageStatus.QUEUED  # untouched — no side effects to undo
 
 
+async def test_recover_from_crash_reverts_processing_documents_to_queued(
+    repository: Repository, embedder: MockEmbedder, tmp_path: Path
+) -> None:
+    """PROCESSING_DOCUMENTS means only _wait_for_documents_ready has run —
+    no model state touched, exactly as safe to resume as a row that never
+    left QUEUED. Reverting it (rather than leaving it as-is, or erroring it
+    like RETRIEVING/GENERATING) matters concretely:
+    get_oldest_queued_message() filters on literal QUEUED, so a row left at
+    PROCESSING_DOCUMENTS would never be picked up again — stuck forever,
+    neither retried nor surfaced as a failure."""
+    worker = _make_worker(repository, embedder, _ScriptedDriver(["ok"]), tmp_path)
+    await repository.create_conversation(Conversation(id="conv-crash-2", title="test"))
+    await repository.create_message(
+        Message(
+            id="waiting-on-docs",
+            conversation_id="conv-crash-2",
+            role="assistant",
+            content="",
+            status=MessageStatus.PROCESSING_DOCUMENTS,
+        )
+    )
+
+    await worker.recover_from_crash()
+
+    reverted = await repository.get_message("waiting-on-docs")
+    assert reverted is not None
+    assert reverted.status == MessageStatus.QUEUED
+
+
+async def test_processing_documents_status_shown_while_document_still_ingesting(
+    repository: Repository, embedder: MockEmbedder, tmp_path: Path
+) -> None:
+    """Without this status, a message sent alongside a freshly-uploaded
+    document would show the generic "queued" for the entire
+    extract/chunk/embed/index duration — indistinguishable from genuinely
+    waiting behind another generation, which this is not: the job has
+    already been picked up, it's just blocked on IngestionWorker."""
+    driver = _ScriptedDriver(["ok"])
+    worker = _make_worker(repository, embedder, driver, tmp_path)
+    conversation_id = "conv-with-pending-doc"
+    await repository.create_conversation(Conversation(id=conversation_id, title="test"))
+    document = Document(
+        id="pending-doc",
+        conversation_id=conversation_id,
+        filename="manual.pdf",
+        source_kind=SourceKind.PDF,
+        content_hash="test-hash",
+        status=DocumentStatus.EXTRACTING,  # deliberately non-terminal
+    )
+    await repository.create_document(document)
+    message_id = await _seed_exchange(repository, conversation_id, "question about the doc")
+
+    worker.start()
+    try:
+        async with asyncio.timeout(5.0):
+            while True:
+                message = await repository.get_message(message_id)
+                assert message is not None
+                if message.status == MessageStatus.PROCESSING_DOCUMENTS:
+                    break
+                await asyncio.sleep(0.01)
+
+        # Simulate IngestionWorker finishing while the job is still
+        # waiting: index the chunk, then flip the document terminal. The
+        # job should then proceed exactly as if it had never had to wait.
+        chunk = Chunk(
+            id="pending-doc-chunk",
+            document_id=document.id,
+            conversation_id=conversation_id,
+            text="relevant fact.",
+            source_ref=PageRef(page=1),
+            chunk_index=0,
+        )
+        await repository.create_chunks([chunk])
+        index = NumpyFlatIndex()
+        index.add([chunk.id], await embedder.embed_documents([chunk.text]))
+        index_dir = tmp_path / "index"
+        await asyncio.to_thread(index_dir.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(index.save, index_dir / f"{conversation_id}.npz")
+        await repository.update_document_status(document.id, DocumentStatus.INDEXED)
+
+        final = await _wait_until_terminal(repository, message_id)
+        assert final.status == MessageStatus.DONE
+    finally:
+        await worker.stop()
+
+
 async def test_mid_stream_exception_preserves_partial_content_and_worker_survives(
     repository: Repository, embedder: MockEmbedder, tmp_path: Path
 ) -> None:
@@ -408,9 +490,67 @@ async def test_mid_stream_exception_preserves_partial_content_and_worker_survive
         await worker.stop()
 
 
+class _AlwaysRaisingDriver(LLMDriver):
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        raise RuntimeError("simulated persistent generation failure")
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+
+async def test_process_job_backs_off_and_keeps_processing_when_finalize_message_stays_broken(
+    repository: Repository, embedder: MockEmbedder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for a real "database is locked" seen live: a job
+    failed, and recording it as ERROR (inside _process_job's except block)
+    *also* failed, on the same lock. Without a fix, that second exception
+    escapes _process_job uncaught and lands in run()'s outer except Exception
+    — which has no backoff — turning a transient lock into a zero-delay
+    retry storm.
+
+    finalize_message now retries transient locks on its own (see
+    test_finalize_message_survives_a_transient_lock_without_losing_the_answer
+    in tests/test_repository.py), so this test covers what's left for
+    _process_job itself: if finalize_message is broken for the full run of
+    ITS OWN retries, _process_job must catch that rather than let it escape,
+    the affected message is left stuck at a non-terminal status (there is
+    nothing else that will ever retry it once past QUEUED — a known,
+    accepted limitation, not silently hidden), and — the actual proof the
+    loop survived rather than wedging — the worker must still pick up and
+    finish a later, unrelated job."""
+    driver = _AlwaysRaisingDriver()
+    worker = _make_worker(repository, embedder, driver, tmp_path)
+    await _seed_chunk_with_index(repository, embedder, "conv-lock", tmp_path / "index", "some fact.")
+    broken_id = await _seed_exchange(repository, "conv-lock", "a question")
+
+    real_finalize = repository.finalize_message
+
+    async def flaky_finalize(message_id: str, *args: object, **kwargs: object) -> None:
+        if message_id == broken_id:
+            raise RuntimeError("simulated database is locked, retries exhausted")
+        await real_finalize(message_id, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repository, "finalize_message", flaky_finalize)
+
+    worker.start()
+    try:
+        # Give the worker a chance to attempt (and permanently fail to
+        # record) the broken job before asserting it's stuck.
+        await asyncio.sleep(0.3)
+        stuck = await repository.get_message(broken_id)
+        assert stuck is not None
+        assert stuck.status not in (MessageStatus.DONE, MessageStatus.ERROR)
+        assert worker._consecutive_finalize_failures >= 1
+
+        second_id = await _seed_exchange(repository, "conv-lock", "a different question")
+        second = await _wait_until_terminal(repository, second_id, timeout_seconds=2.0)
+        assert second.status == MessageStatus.ERROR  # the driver always raises
+        assert worker._consecutive_finalize_failures == 0
+    finally:
+        await worker.stop()
+
+
 async def test_locked_embedder_prevents_the_pre_existing_concurrency_race() -> None:
-    """Regression test for the race confirmed by reading llama_cpp's actual
-    source: no internal locking, multi-step mutation of instance state.
+    """Regression test for the race enabled by llama_cpp's real embedder
+    having no internal locking (multi-step mutation of instance state).
     Without LockedEmbedder's lock, these two concurrent calls interleave at
     the injected yield point and one clobbers the other's shared state,
     failing the assertion inside _RacyEmbedder._embed_one."""

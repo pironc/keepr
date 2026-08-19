@@ -20,3 +20,10 @@ class Embedder(Protocol):
     async def embed_documents(self, texts: list[str]) -> NDArray[np.float32]: ...
 
     async def embed_query(self, text: str) -> NDArray[np.float32]: ...
+
+    async def availability(self) -> str | None:
+        """Return a human-readable reason the embedding model can't be used, or
+        ``None`` if it is usable.  Must be cheap (no model load) so callers can
+        probe sibling-model availability without triggering an expensive GGUF
+        load."""
+        ...

@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 
 
 class DocumentStatus(StrEnum):
-    STAGED = "staged"
     UPLOADING = "uploading"
     EXTRACTING = "extracting"
     CHUNKING = "chunking"
@@ -27,14 +26,24 @@ class DocumentStatus(StrEnum):
 
 
 class MessageStatus(StrEnum):
-    """QUEUED and RETRIEVING are deliberately distinct: QUEUED means a
-    GenerationWorker job exists but hasn't started (including "waiting its
-    turn behind another generation"); RETRIEVING means it has the
-    generation lock and is actively embedding/searching. Defaults to DONE
-    on Message (see below) so every user message — which has no lifecycle
-    at all — needs zero special-casing."""
+    """QUEUED, PROCESSING_DOCUMENTS, and RETRIEVING are deliberately
+    distinct: QUEUED means a GenerationWorker job exists but hasn't been
+    picked up yet — genuinely waiting its turn behind another generation,
+    since only one runs at a time app-wide. PROCESSING_DOCUMENTS means the
+    worker HAS picked this job up (nothing is ahead of it anymore) but is
+    blocked on IngestionWorker finishing this conversation's attached
+    document(s) — a real, separate wait, not the generation queue at all
+    (see GenerationWorker._wait_for_documents_ready). RETRIEVING means it
+    has the generation lock and is actively embedding/searching. Without
+    PROCESSING_DOCUMENTS, a message sent alongside a freshly-uploaded
+    document would show "Queued" for the entire extract/chunk/embed/index
+    duration, reading as "waiting behind other work" when nothing else is
+    actually queued at all. Defaults to DONE on Message (see below) so
+    every user message — which has no lifecycle at all — needs zero
+    special-casing."""
 
     QUEUED = "queued"
+    PROCESSING_DOCUMENTS = "processing-documents"
     RETRIEVING = "retrieving"
     GENERATING = "generating"
     DONE = "done"
@@ -84,7 +93,7 @@ class Document(BaseModel):
     filename: str
     source_kind: SourceKind
     content_hash: str
-    status: DocumentStatus = DocumentStatus.STAGED
+    status: DocumentStatus
     error_message: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

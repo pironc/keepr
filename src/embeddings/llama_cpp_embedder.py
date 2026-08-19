@@ -27,8 +27,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from src.logger import get_logger
+from src.model_unavailable import ModelRole, ModelUnavailableError
 
 logger = get_logger(__name__)
+
+_MISSING_MSG_LEAD = "Embedding model file not found"
+_LOAD_MSG_LEAD = "Embedding model could not be loaded — the file may be corrupted or the wrong architecture for this build of keepr"
 
 _DOCUMENT_PREFIX = "search_document: "
 _QUERY_PREFIX = "search_query: "
@@ -62,15 +66,47 @@ class LlamaCppEmbedder:
 
     def _load(self) -> None:
         """Load the GGUF model into memory (called inside _embed_sync, which
-        runs in the _run_sync_uncancellable thread — cancellation-safe)."""
+        runs in the _run_sync_uncancellable thread — cancellation-safe).
+
+        Any load-time failure (missing file, corrupted/truncated GGUF, wrong
+        architecture, OOM) is surfaced as a :class:`ModelUnavailableError` —
+        never a raw llama-cpp exception — so the ingestion pipeline and RAG
+        engine can turn it into a readable, actionable error instead of
+        crashing the SSE stream."""
         from llama_cpp import Llama  # lazy: only needed when this embedder is actually selected
 
+        if not self._model_path.is_file():
+            raise ModelUnavailableError(
+                f"{_MISSING_MSG_LEAD}: {self._model_path}. "
+                "Download it in Settings → Models, or copy a .gguf file into it.",
+                role=ModelRole.EMBEDDING,
+            )
         logger.info("llama_cpp: loading embedder %s …", self._model_path.name)
-        self._model = Llama(
-            model_path=str(self._model_path), embedding=True,
-            n_gpu_layers=self._n_gpu_layers, verbose=False,
-        )
+        try:
+            self._model = Llama(
+                model_path=str(self._model_path), embedding=True,
+                n_gpu_layers=self._n_gpu_layers, verbose=False,
+            )
+        except Exception as exc:  # corrupt/truncated/wrong-gauge load failures
+            raise ModelUnavailableError(
+                f"{_LOAD_MSG_LEAD}: {self._model_path.name}. "
+                "Try re-downloading the model.",
+                role=ModelRole.EMBEDDING,
+            ) from exc
         logger.info("llama_cpp: embedder loaded")
+
+    async def availability(self) -> str | None:
+        """Cheap availability check (no model load): the embedder is usable
+        only if its GGUF file exists on disk.  A file that exists but later
+        fails to load is *not* reported here — that is only discoverable at
+        embed time, when the load-time ``ModelUnavailableError`` carries the
+        specific corrupt/wrong-architecture reason."""
+        if not self._model_path.is_file():
+            return (
+                f"{_MISSING_MSG_LEAD}: {self._model_path.name}. "
+                "Download it in Settings → Models, or copy a .gguf file into it."
+            )
+        return None
 
     def unload(self) -> None:
         """Free the model (e.g. after an idle timeout).  Safe to call multiple times."""
@@ -98,7 +134,7 @@ async def _run_sync_uncancellable[T](func: Callable[..., T], *args: Any) -> T:
     model from a second thread simultaneously, corrupting internal state
     (observed as an GGML_ASSERT crash in ggml-cpu/repack.cpp).
 
-    Two cancellation subtleties, both confirmed by minimal reproduction:
+    Two cancellation subtleties:
 
     1. **shield.** ``Task.cancel()`` also calls ``self._fut_waiter.cancel()``
        on the inner future from ``run_in_executor``, permanently cancelling

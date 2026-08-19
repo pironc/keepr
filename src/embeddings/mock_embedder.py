@@ -30,6 +30,10 @@ class MockEmbedder:
     async def embed_query(self, text: str) -> NDArray[np.float32]:
         return self._embed_one(text)
 
+    async def availability(self) -> str | None:
+        """The mock embedder is always usable — it needs no model file."""
+        return None
+
     def _embed_one(self, text: str) -> NDArray[np.float32]:
         vector = np.zeros(self.dimensions, dtype=np.float32)
         for word in _WORD_PATTERN.findall(text.lower()):

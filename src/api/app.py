@@ -5,23 +5,27 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import AsyncIterator
+import typing
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from starlette.staticfiles import StaticFiles as _StaticFiles
+from starlette.types import Receive, Scope, Send
 
 from src.api.context import AppContext
 from src.api.routes_conversations import router as conversations_router
 from src.api.routes_messages import router as messages_router
+from src.api.routes_models import router as models_router
 from src.concurrency import LockedEmbedder, LockedLLMDriver
 from src.config import Settings
 from src.db.pool import SQLiteConnectionPool
 from src.db.repository import Repository
 from src.embeddings.factory import build_embedder
 from src.ingestion.pipeline import IngestionPipeline
+from src.ingestion.worker import IngestionWorker
 from src.llm.factory import build_llm_driver
 from src.logger import get_logger
 from src.rag.engine import RagEngine
@@ -63,13 +67,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         top_k=settings.retrieval_top_k,
         min_similarity=settings.retrieval_min_similarity,
     )
-    generation_worker = GenerationWorker(repository, engine, index_manager, llm_driver, pipeline, settings.upload_dir, embedder)
+    generation_worker = GenerationWorker(repository, engine, index_manager, llm_driver)
+    ingestion_worker = IngestionWorker(repository, pipeline, index_manager, embedder)
     # Before the app can serve a single request: a message stuck at
     # RETRIEVING/GENERATING means a worker was actively touching the model
-    # when the process last stopped. Note `make run` uses --reload, so this
+    # when the process last stopped, and a document stuck mid-pipeline means
+    # the same for IngestionWorker. Note `make run` uses --reload, so this
     # fires on every file save during development, not just a rare crash.
+    # Order between the two doesn't matter — they touch disjoint tables.
     await generation_worker.recover_from_crash()
+    await ingestion_worker.recover_from_crash()
     generation_worker.start()
+    ingestion_worker.start()
 
     app.state.context = AppContext(
         settings=settings,
@@ -80,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pipeline=pipeline,
         engine=engine,
         generation_worker=generation_worker,
+        ingestion_worker=ingestion_worker,
         db_pool=db_pool,
     )
     logger.info(
@@ -97,24 +107,52 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await generation_worker.stop()
         finally:
             try:
-                await db_pool.close()
+                await ingestion_worker.stop()
             finally:
                 try:
-                    aclose = getattr(llm_driver, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
+                    await db_pool.close()
                 finally:
-                    aclose = getattr(embedder, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
+                    try:
+                        aclose = getattr(llm_driver, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                    finally:
+                        aclose = getattr(embedder, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
 
 
 app = FastAPI(title="keepr", version="0.1.0", lifespan=lifespan)
 app.include_router(conversations_router)
 app.include_router(messages_router)
+app.include_router(models_router)
 _web_dir = os.environ.get("KEEPR_WEB_DIR", "src/web")
 
-app.mount("/static", StaticFiles(directory=os.path.join(_web_dir, "static")), name="static")
+class _NoCacheStaticFiles(_StaticFiles):
+    """Static assets with `Cache-Control: no-cache`.
+
+    The desktop wrapper (Tauri/WKWebView) heuristically caches JS/CSS that
+    come back without an explicit Cache-Control header, so an edited
+    ``app.js``/``app.css`` can keep serving the stale copy from cache even
+    after a restart. Forcing `no-cache` makes the client revalidate against
+    the ETag/Last-Modified that StaticFiles already sends, so code changes
+    are picked up immediately. "no-store" is deliberately avoided — the
+    static assets never change at runtime, so conditional revalidation is
+    the right (cheap) semantics.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_header(message: MutableMapping[str, typing.Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", ()))
+                headers.append((b"cache-control", b"no-cache"))
+                message = {"type": message["type"], "status": message["status"], "headers": headers}
+            await send(message)
+
+        await super().__call__(scope, receive, send_with_header)
+
+
+app.mount("/static", _NoCacheStaticFiles(directory=os.path.join(_web_dir, "static")), name="static")
 
 
 _INDEX_HTML = os.path.join(_web_dir, "templates", "index.html")

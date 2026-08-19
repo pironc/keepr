@@ -7,6 +7,8 @@ SQLite -> Postgres swap (see ARCHITECTURE.md) contained to this one file.
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -186,7 +188,17 @@ class Repository:
             # to actually finalise an explicit transaction.  Likewise, a
             # failure between BEGIN and COMMIT would leak the RESERVED lock
             # back into the pool forever — we ROLLBACK on any error to
-            # prevent that.
+            # prevent that. COMMIT itself is inside this same try/except: a
+            # transient failure *at* COMMIT (SQLITE_BUSY, disk I/O, whatever)
+            # leaves the transaction just as open as a failed INSERT would —
+            # if it's left to raise past this block uncaught, the connection
+            # goes back to the pool (acquire()'s finally runs unconditionally)
+            # still mid-transaction, and every other connection's writes
+            # start failing with "database is locked" until the process
+            # restarts, since SQLite's write lock isn't per-connection.
+            # A forced COMMIT failure here otherwise wedges an unrelated
+            # write on a second pool connection until busy_timeout gives up
+            # (see tests/test_repository.py).
             await connection.execute("BEGIN IMMEDIATE")
             try:
                 await connection.executemany(
@@ -206,10 +218,10 @@ class Repository:
                         for chunk in chunks
                     ],
                 )
+                await connection.execute("COMMIT")
             except Exception:
                 await connection.execute("ROLLBACK")
                 raise
-            await connection.execute("COMMIT")
 
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[Chunk]:
         if not chunk_ids:
@@ -226,18 +238,6 @@ class Repository:
             rows = await cursor.fetchall()
         by_id = {row["id"]: _chunk_from_row(row) for row in rows}
         return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id]
-
-    async def list_chunks(self, conversation_id: str) -> list[Chunk]:
-        async with self._pool.acquire() as connection:
-            cursor = await connection.execute(
-                """
-                SELECT id, document_id, conversation_id, chunk_index, text, source_ref_json
-                FROM chunks WHERE conversation_id = ? ORDER BY document_id, chunk_index
-                """,
-                (conversation_id,),
-            )
-            rows = await cursor.fetchall()
-        return [_chunk_from_row(row) for row in rows]
 
     # -- messages --------------------------------------------------
 
@@ -296,6 +296,11 @@ class Repository:
             )
             await connection.commit()
 
+    # Retry delays for finalize_message below: 0.1, 0.2, 0.4, 0.8, 1.6s (~3.1s
+    # total on top of the first, immediate attempt) — each retry gets its own
+    # fresh 5s busy_timeout window on a (likely different) pooled connection.
+    _FINALIZE_LOCK_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8, 1.6)
+
     async def finalize_message(
         self,
         message_id: str,
@@ -307,22 +312,47 @@ class Repository:
         # Deliberately never touches created_at — a slower-but-first-asked
         # message must stay ordered ahead of a faster-but-later one
         # regardless of which one's generation actually finishes first.
-        async with self._pool.acquire() as connection:
-            await connection.execute(
-                """
-                UPDATE messages
-                SET content = ?, citations_json = ?, status = ?, error_message = ?
-                WHERE id = ?
-                """,
-                (
-                    content,
-                    _citations_adapter.dump_json(citations).decode("utf-8"),
-                    status.value,
-                    error_message,
-                    message_id,
-                ),
-            )
-            await connection.commit()
+        #
+        # Retries on "database is locked": this single write persists a
+        # fully-generated answer — the most expensive, least-replaceable
+        # result in the app (a real LLM generation already paid for).
+        # Sustained write contention from a second conversation's own
+        # ingestion/generation can outlast one connection's own 5s
+        # busy_timeout; without this retry, the caller (RagEngine._finalize)
+        # raises, the answer text never reaches the caller that DOES have
+        # it, and generation_worker.py's own failure handling then persists
+        # an empty-content ERROR instead — a real, already-computed answer
+        # silently thrown away. Scoped to this one call, not a blanket
+        # retry-everything policy: a genuinely broken statement (bad SQL, a
+        # constraint violation) fails the same way on every attempt, so the
+        # cost for that case is a few wasted seconds before the same error
+        # surfaces, not a masked bug.
+        params = (
+            content,
+            _citations_adapter.dump_json(citations).decode("utf-8"),
+            status.value,
+            error_message,
+            message_id,
+        )
+        attempts = (0.0, *self._FINALIZE_LOCK_RETRY_DELAYS)
+        for i, delay in enumerate(attempts):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with self._pool.acquire() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE messages
+                        SET content = ?, citations_json = ?, status = ?, error_message = ?
+                        WHERE id = ?
+                        """,
+                        params,
+                    )
+                    await connection.commit()
+                return
+            except sqlite3.OperationalError:
+                if i == len(attempts) - 1:
+                    raise
 
     async def get_oldest_queued_message(self) -> Message | None:
         # Unscoped by conversation_id on purpose: there is one GenerationWorker,
@@ -351,6 +381,41 @@ class Repository:
             )
             rows = await cursor.fetchall()
         return [_message_from_row(row) for row in rows]
+
+    _DOCUMENT_TERMINAL_STATUSES = (
+        DocumentStatus.INDEXED.value,
+        DocumentStatus.ERROR.value,
+        DocumentStatus.UNSUPPORTED.value,
+    )
+
+    async def get_oldest_pending_document(self) -> Document | None:
+        # Unscoped by conversation_id on purpose: there is one IngestionWorker,
+        # one queue, app-wide (one shared embedder instance behind it) —
+        # mirrors get_oldest_queued_message()'s exact reasoning.
+        async with self._pool.acquire() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT id, conversation_id, filename, source_kind, content_hash, status, error_message, created_at
+                FROM documents WHERE status NOT IN (?, ?, ?)
+                ORDER BY created_at ASC, rowid ASC LIMIT 1
+                """,
+                self._DOCUMENT_TERMINAL_STATUSES,
+            )
+            row = await cursor.fetchone()
+        return _document_from_row(row) if row is not None else None
+
+    async def list_nonterminal_documents(self) -> list[Document]:
+        async with self._pool.acquire() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT id, conversation_id, filename, source_kind, content_hash, status, error_message, created_at
+                FROM documents WHERE status NOT IN (?, ?, ?)
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                self._DOCUMENT_TERMINAL_STATUSES,
+            )
+            rows = await cursor.fetchall()
+        return [_document_from_row(row) for row in rows]
 
 
     async def update_conversation_pinned(self, conversation_id: str, pinned: bool) -> None:
@@ -393,7 +458,12 @@ class Repository:
 
 
 def _conversation_from_row(row: Any) -> Conversation:
-    pinned = bool(row["pinned"]) if "pinned" in row else False
+    # NOTE: no `"pinned" in row` guard here — aiosqlite.Row (sqlite3.Row) does
+    # NOT support the `in` operator and returns False for every membership
+    # query, which would silently drop the pin state (pinned would always read
+    # False after the ALTER-added pinned column returned a real value).  Every
+    # SELECT here lists pinned explicitly, so the column is always present.
+    pinned = bool(row["pinned"])
     return Conversation(
         id=row["id"], title=row["title"], pinned=pinned, created_at=row["created_at"], updated_at=row["updated_at"]
     )

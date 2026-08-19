@@ -18,11 +18,21 @@ reader, `_strip_citation_tags` removes every tag from the display text
 entirely: citations are already rendered as clickable badges in the side
 panel, so inline markers in the answer body are redundant noise. A tag
 that didn't survive citation verification (fabricated by the model) is
-also dropped from the citation list.
+also dropped from the citation list. A model that ignores the `[chunk_N]`
+instruction and writes a bare `[1]`/`[2]` directly gets the same treatment
+(`_BARE_NUMBER_PATTERN`) — unverifiable either way, since no bare number
+can be traced back to a specific retrieved chunk.
+
+Both patterns are also stripped from the *streaming* text as it's
+generated (`_stream_strip_citation_tags`), not just this final pass — a
+tag that streamed to the reader as visible plain text and then vanished
+the moment this final pass reran on the complete answer would read as a
+bug, not a grounding mechanism.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from collections.abc import AsyncIterator
@@ -31,6 +41,7 @@ from dataclasses import dataclass
 from src.db.repository import Repository
 from src.embeddings.base import Embedder
 from src.llm.base import LLMDriver
+from src.model_unavailable import ModelUnavailableError
 from src.models import Chunk, Citation, LLMMessage, Message, MessageStatus
 from src.rag.greeting import detect_greeting_or_farewell
 from src.rag.prompts import REFUSAL_TEXT, build_context_block, build_system_prompt
@@ -40,6 +51,38 @@ _CITATION_PATTERN = re.compile(r"\[(chunk_\d+)\]")
 # Used for stripping complete [chunk_N] tags from streaming tokens — must
 # match the same pattern as _CITATION_PATTERN but anchored to the full tag.
 _TAG_PATTERN = re.compile(r"\[chunk_\d+\]")
+
+
+def _embedder_unavailable_text() -> str:
+    """User-facing text when the embedding model is unavailable but the
+    language model (checked elsewhere) is fine.  Kept concise — the per-file
+    reason lives in the message's ``error_message``, not in the chat text."""
+    return (
+        "I couldn't look up an answer because no embedding model is installed. "
+        "Download one in Settings → Models."
+    )
+
+
+def _both_models_unavailable_text() -> str:
+    """User-facing text when neither an embedding nor a language model is
+    installed.  Kept short on purpose: the user asked for just a statement that
+    nothing is downloaded, not the per-file reasons (those live in the
+    ``error_message`` for diagnostics)."""
+    return (
+        "I couldn't look up an answer — neither an embedding model "
+        "nor a language model is downloaded. Get them in Settings → Models."
+    )
+
+
+def _language_model_unavailable_text() -> str:
+    """User-facing text when retrieval succeeded but the language model is
+    unavailable — the current chat's documents were still read, it just couldn't
+    generate an answer.  Kept concise — the per-file reason lives in the
+    message's ``error_message``, not in the chat text."""
+    return (
+        "I couldn't generate an answer because no language model is installed. "
+        "Download one in Settings → Models."
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,9 +128,38 @@ class RagEngine:
         driver: LLMDriver,
         message_id: str | None = None,
     ) -> AsyncIterator[RagEvent]:
+        # "No model installed" is checked *before* anything else, including the
+        # greeting fast-path below — a bare "hi" must surface the missing-model
+        # error rather than a cheerful canned reply that papers over the fact
+        # that nothing is installed.  Each availability() is a cheap
+        # file-existence stat (no model load), so this stays instant.  On the
+        # GenerationWorker path (message_id set) this finalizes an ERROR
+        # message; direct-call tests (message_id None) just stop early with the
+        # canned reply rather than raising.  If only ONE model is missing this
+        # gate is skipped and the regular path reports exactly which one when
+        # it actually fails.
+        open_emb_reason, open_llm_reason = await asyncio.gather(
+            self._embedder.availability(), driver.availability()
+        )
+        if open_emb_reason is not None and open_llm_reason is not None:
+            message = await self._finalize(
+                conversation_id,
+                _both_models_unavailable_text(),
+                [],
+                message_id=message_id,
+                status=MessageStatus.ERROR,
+                error_message=f"{open_emb_reason} {open_llm_reason}",
+            )
+            if message_id is not None:
+                yield MessageStatusEvent(message_id, MessageStatus.ERROR, str(open_emb_reason))
+            yield DoneEvent(message=message)
+            return
+
         # Fast-path: a greeting or farewell needs no retrieval and no LLM —
         # return a canned response instantly. Only the *entire* input is
         # considered; "hi, what's the capital?" passes through unchanged.
+        # (Reached only once the model check above has confirmed at least one
+        # model is available.)
         greeting = detect_greeting_or_farewell(question)
         if greeting is not None:
             message = await self._finalize(
@@ -105,7 +177,41 @@ class RagEngine:
             await self._repository.update_message_status(message_id, MessageStatus.RETRIEVING)
             yield MessageStatusEvent(message_id, MessageStatus.RETRIEVING)
 
-        query_vector = await self._embedder.embed_query(question)
+        try:
+            query_vector = await self._embedder.embed_query(question)
+        except ModelUnavailableError as exc:
+            # Embedding model missing or unloadable — can't retrieve anything,
+            # so there's no context to ground an answer. Mirrors the
+            # generation-error handling below: when GenerationWorker is driving
+            # this (message_id set) mark the message ERROR with an actionable
+            # description; direct-call tests (message_id None) see today's
+            # behavior of propagating immediately, since they never encounter
+            # a real embedder.
+            if message_id is None:
+                raise
+            # Retrieval failed before the LLM was ever reached, so this call
+            # alone can't see the language model's state.  Probe it cheaply
+            # (no model load) so a user who has *neither* model installed gets
+            # both named rather than a misleading "only the embedder is
+            # missing".  (The upfront both-missing gate below usually catches
+            # this case first — this is the fallback for when the embedder's
+            # FILE exists but fails to *load* (e.g. corrupt), making the
+            # cheap upfront probe miss it.)
+            llm_reason = await driver.availability()
+            body = _embedder_unavailable_text()
+            if llm_reason is not None:
+                body = _both_models_unavailable_text()
+            message = await self._finalize(
+                conversation_id,
+                body,
+                [],
+                message_id=message_id,
+                status=MessageStatus.ERROR,
+                error_message=str(exc),
+            )
+            yield MessageStatusEvent(message_id, MessageStatus.ERROR, str(exc))
+            yield DoneEvent(message=message)
+            return
         scored = index.search(query_vector, self._top_k)
 
         # Filter every retrieved chunk against the bar individually, not
@@ -166,11 +272,29 @@ class RagEngine:
                 clean, strip_buffer = _stream_strip_citation_tags(token, strip_buffer)
                 if clean:
                     yield TokenEvent(text=clean)
+        except ModelUnavailableError as exc:
+            # The selected language model is missing on disk or failed to load
+            # (corrupt/truncated/wrong architecture). Retrieval already
+            # succeeded, so only the language model can be at fault here — say
+            # so plainly and surface the underlying reason.  Direct-call tests
+            # (message_id None) propagate exactly as before.
+            if message_id is None:
+                raise
+            message = await self._finalize(
+                conversation_id,
+                _language_model_unavailable_text(),
+                [],
+                message_id=message_id,
+                status=MessageStatus.ERROR,
+                error_message=str(exc),
+            )
+            yield MessageStatusEvent(message_id, MessageStatus.ERROR, str(exc))
+            yield DoneEvent(message=message)
+            return
         except Exception as exc:
             # Only reachable when GenerationWorker is driving this (message_id
-            # set) — without it, propagate exactly as before: no try/except
-            # existed here previously, and the 6 direct-call tests must see
-            # identical behavior on a raising driver.
+            # set) — without it, propagate unchanged, since the 6 direct-call
+            # tests must see identical behavior on a raising driver.
             if message_id is None:
                 raise
             interrupted_text = (
@@ -269,7 +393,11 @@ _REPEATED_WHITESPACE = re.compile(r"[ \t]{2,}")
 # Catches bare [1], [2], … the model wrote directly instead of the
 # required [chunk_N] format.  These can't be verified against any
 # retrieved chunk, so the only safe move is to strip them before they
-# reach the frontend as dead, non-clickable markers.
+# reach the frontend as dead, non-clickable markers — both here (the final
+# pass) and in _stream_strip_citation_tags below (the streaming pass);
+# without the latter, a deviating model's bare "[1]" streams to the reader
+# as plain text and then visibly vanishes the moment this pass reruns on
+# the complete answer_text and removes what it never should have shown.
 _BARE_NUMBER_PATTERN = re.compile(r"\[\d+\]")
 # When a [chunk_N] tag is removed mid-sentence it can leave a dangling
 # preposition/article before the punctuation — "as described in [chunk_3]."
@@ -281,21 +409,30 @@ _DANGLING_WORD_BEFORE_PUNCTUATION = re.compile(
 
 
 def _stream_strip_citation_tags(token_text: str, buffer: str) -> tuple[str, str]:
-    """Strip ``[chunk_N]`` from streaming text, handling tags split across tokens.
+    """Strip ``[chunk_N]`` and bare ``[N]`` from streaming text, handling tags
+    split across tokens.
 
     Returns ``(clean_text_to_yield, new_buffer)``.  The buffer carries over
-    a partial tag prefix (e.g. ``"[chu"``) across token boundaries so the
-    complete tag can be stripped once all its pieces arrive.  A partial prefix
-    is only recognised when the text since the last ``[`` looks like it could
-    become a ``[chunk_N]`` tag given another token — a bare ``[note]`` or
-    ``[chunk_size]`` is yielded immediately because neither matches the
-    ``[chunk_`` + digits + ``]`` shape.
+    a partial tag prefix (e.g. ``"[chu"`` or, for a bare tag, ``"[1"``) across
+    token boundaries so the complete tag can be stripped once all its pieces
+    arrive.  A partial prefix is only recognised when the text since the last
+    ``[`` looks like it could still become one of the two tag shapes given
+    another token — a bare ``[note]`` or ``[chunk_size]`` is yielded
+    immediately because neither matches ``[chunk_`` + digits + ``]`` or
+    ``[`` + digits + ``]``.
+
+    The bare-``[N]``  half of this mirrors ``_strip_citation_tags``' own
+    ``_BARE_NUMBER_PATTERN`` pass below — without it, a model that deviates
+    from the required ``[chunk_N]`` format and writes a bare ``[1]`` directly
+    streams it to the reader as plain text, which then visibly vanishes the
+    moment the final pass reruns on the complete answer and removes it.
     """
     combined = buffer + token_text
     clean = _TAG_PATTERN.sub("", combined)
+    clean = _BARE_NUMBER_PATTERN.sub("", clean)
 
-    # Find the last "[" — if what follows could be the start of a
-    # [chunk_N] tag, keep it in the buffer for the next token.
+    # Find the last "[" — if what follows could be the start of either tag
+    # shape, keep it in the buffer for the next token.
     last_bracket = clean.rfind("[")
     if last_bracket == -1:
         return clean, ""
@@ -308,7 +445,8 @@ def _stream_strip_citation_tags(token_text: str, buffer: str) -> tuple[str, str]
 
 
 def _is_partial_citation_tag(s: str) -> bool:
-    """True when *s* could be the start of a ``[chunk_N]`` tag."""
+    """True when *s* could be the start of a ``[chunk_N]`` tag or a bare
+    ``[N]`` tag the model wrote directly instead."""
     if not s or s[0] != "[":
         return False
     # Every complete prefix of "[chunk_" — "[", "[c", "[ch", …
@@ -319,7 +457,10 @@ def _is_partial_citation_tag(s: str) -> bool:
         after = s[len("[chunk_"):]
         # Digits (or empty — the number hasn't arrived yet)
         return after == "" or after.isdigit()
-    return False
+    # Not a "[chunk_" prefix (and not just "[" alone, already handled above)
+    # — could still be a bare [N] tag in progress, e.g. "[1", "[42", if
+    # everything since the "[" is digits so far.
+    return s[1:].isdigit()
 
 
 def _strip_citation_tags(answer_text: str) -> str:

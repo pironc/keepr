@@ -1,16 +1,16 @@
 """Serializes access to the shared llama.cpp model instances.
 
-Reading the installed llama_cpp source directly (`.venv/lib/python3.13/
-site-packages/llama_cpp/llama.py`) confirms there is no internal locking
-anywhere in the `Llama` class — both `embed()` and `generate()` mutate
-substantial non-atomic instance state (batch reset -> accumulate -> decode
--> reset). `IngestionPipeline`'s embedding calls and `RagEngine`'s query
-embedding call run on the same singleton `LlamaCppEmbedder` with zero
+The installed llama_cpp source (`.venv/lib/python3.13/
+site-packages/llama_cpp/llama.py`) has no internal locking anywhere in the
+`Llama` class — both `embed()` and `generate()` mutate substantial
+non-atomic instance state (batch reset -> accumulate -> decode -> reset).
+`IngestionPipeline`'s embedding calls and `RagEngine`'s query embedding
+call run on the same singleton `LlamaCppEmbedder` with zero
 synchronization today: a file upload embedding chunks while a question is
-being embedded for retrieval can already race and corrupt shared model
-state, independent of anything else.
+being embedded for retrieval can race and corrupt shared model state,
+independent of anything else.
 
-The fix is structural, not a lock added at today's 2-3 call sites: wrap
+Solved structurally, not with a lock added at today's 2-3 call sites: wrap
 the embedder and driver once, at construction time, so every future call
 site is forced through the same lock automatically.
 
@@ -52,12 +52,16 @@ class LockedEmbedder:
         async with self._lock:
             return await self._inner.embed_query(text)
 
+    async def availability(self) -> str | None:
+        """Cheap sibling-probe (no model load) forwarded to the inner embedder."""
+        return await self._inner.availability()
+
     async def unload(self) -> None:
         """Free the inner model (e.g. after an idle timeout)."""
         unload = getattr(self._inner, "unload", None)
         if unload is not None:
             async with self._lock:
-                await asyncio.get_running_loop().run_in_executor(None, unload)
+                await asyncio.to_thread(unload)
 
     async def aclose(self) -> None:
         """Shutdown cleanup for the inner model."""
@@ -85,6 +89,10 @@ class LockedLLMDriver(LLMDriver):
         async with self._lock, contextlib.aclosing(inner_stream) as stream:
             async for token in stream:
                 yield token
+
+    async def availability(self) -> str | None:
+        """Cheap sibling-probe (no model load) forwarded to the inner driver."""
+        return await self._inner.availability()
 
     async def unload(self) -> None:
         """Free the inner model (e.g. after an idle timeout)."""

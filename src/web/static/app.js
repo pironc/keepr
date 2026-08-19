@@ -16,6 +16,7 @@ const el = {
   newChatBtn: document.getElementById("new-chat-btn"),
   conversationList: document.getElementById("conversation-list"),
   messages: document.getElementById("messages"),
+  chatPanel: document.querySelector(".chat-panel"),
   stagedTray: document.getElementById("staged-tray"),
   composer: document.getElementById("composer"),
   dropZone: document.getElementById("drop-zone"),
@@ -29,11 +30,78 @@ const el = {
   sidebar: document.getElementById("sidebar"),
   sidebarToggle: document.getElementById("sidebar-toggle"),
   searchChatsBtn: document.getElementById("search-chats-btn"),
+  settingsBtn: document.getElementById("settings-btn"),
+  zoomToast: document.getElementById("zoom-toast"),
 };
+
+// -- zoom (Cmd/Ctrl + Plus/Minus/0) --------------------------------------
+// VS-Code-style whole-layout zoom via the root font-size (see app.css's
+// `html { font-size: ... }` rule and its --zoom custom property), not the
+// CSS `zoom` property (WebKit's getBoundingClientRect() etc. return
+// unscaled values under `zoom` on most currently-deployed Safari/WKWebView
+// versions — only fixed in Safari 26.4, ~March 2026) and not
+// `transform: scale()` (any non-`none` transform on an ancestor becomes the
+// containing block for `position: fixed` descendants, which would break
+// every one of app.css's fixed-positioned sidebar/panel/modal rules).
+// --zoom is the single multiplier every zoom-aware size in app.css, and
+// the root font-size itself, are wrapped in — this is what makes Cmd+/
+// Cmd- scale the whole app (rem-based text/spacing scale via the root
+// font-size cascade; the handful of raw-px chrome sizes are each
+// explicitly wrapped in calc(... * var(--zoom)) in app.css).
+// NOTE: this array is duplicated in index.html's pre-paint inline <script>
+// (no build step/module system to share it across the two files) — keep
+// both in sync if either is edited.
+var ZOOM_LEVELS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+var _ZOOM_DEFAULT_INDEX = ZOOM_LEVELS.indexOf(1.0);
+
+function _loadZoomIndex() {
+  var raw = parseInt(localStorage.getItem("zoom-index"), 10);
+  if (Number.isInteger(raw) && raw >= 0 && raw < ZOOM_LEVELS.length) return raw;
+  return _ZOOM_DEFAULT_INDEX;
+}
+
+// The "real" runtime zoom state. Its pre-paint counterpart is the --zoom
+// custom property index.html's inline <script> already stamped onto
+// <html> before first paint — unlike sidebar/sources collapse, zoom has
+// nothing further to "promote" at init() time: both read the exact same
+// localStorage key, and the CSS custom property IS the runtime state, not
+// just a flash guard for it.
+var _zoomIndex = _loadZoomIndex();
+
+function _showZoomToast(pct) {
+  var toast = el.zoomToast;
+  if (!toast) return;
+  toast.textContent = pct + "%";
+  toast.hidden = false;
+  void toast.offsetHeight; // force reflow so re-triggering restarts the transition
+  toast.classList.add("show");
+  clearTimeout(_showZoomToast._timer);
+  _showZoomToast._timer = setTimeout(function () {
+    toast.classList.remove("show");
+  }, 1200);
+}
+
+function _setZoomIndex(newIndex) {
+  _zoomIndex = Math.max(0, Math.min(ZOOM_LEVELS.length - 1, newIndex));
+  var level = ZOOM_LEVELS[_zoomIndex];
+  document.documentElement.style.setProperty("--zoom", String(level));
+  localStorage.setItem("zoom-index", String(_zoomIndex));
+  _showZoomToast(Math.round(level * 100));
+  // None of these fire on their own for a zoom change (only on `resize`/
+  // init, and changing root font-size doesn't trigger `resize`) — re-run
+  // them explicitly so the 900px auto-collapse threshold, the toast-stack
+  // sizing, and the composer placeholder all catch up immediately instead
+  // of waiting for the next real window resize (which may never happen).
+  _applyResponsiveState();
+  _syncDownloadToastLayout();
+  _updatePromptPlaceholder();
+  _updateTextareaHeight();
+  _syncEmptyPromptGlow();
+}
 
 const STATUS_LABELS = {
   staged: "Staged",
-  queued: "Queued…",
+  queued: "Queued",
   uploading: "Uploading…",
   extracting: "Extracting…",
   chunking: "Chunking…",
@@ -44,7 +112,8 @@ const STATUS_LABELS = {
 };
 
 const MESSAGE_STATUS_LABELS = {
-  queued: "Queued…",
+  queued: "Queued",
+  "processing-documents": "Processing documents…",
   retrieving: "Retrieving…",
 };
 
@@ -76,6 +145,7 @@ const _CHAT_PROMPTS = [
 
 let _promptCycleTimer = null;
 let _promptIsCurrent = true; // true = .prompt-text is showing; false = .prompt-text-next
+let _promptCycleInFlight = false; // true while a _cyclePrompt() fade is still running
 
 function _pickPrompt() {
   return _CHAT_PROMPTS[Math.floor(Math.random() * _CHAT_PROMPTS.length)];
@@ -116,6 +186,13 @@ function _stopPromptCycle() {
 }
 
 function _cyclePrompt() {
+  // Re-entrancy guard: if a previous cycle's fade is still in flight (it
+  // shouldn't be — 5s between ticks is far longer than one cycle's ~600ms —
+  // but this is cheap insurance against whatever could call this again
+  // early, e.g. a throttled/backgrounded tab replaying queued timers in a
+  // burst), just skip this tick rather than starting a second fade on the
+  // same elements a first one hasn't finished with yet.
+  if (_promptCycleInFlight) return;
   const container = document.getElementById("empty-chat-prompt");
   if (!container) return;
 
@@ -132,17 +209,38 @@ function _cyclePrompt() {
     newText = _pickPrompt();
   } while (newText === current.textContent && _CHAT_PROMPTS.length > 1);
 
-  // Fade out visible text, swap underneath, fade in.
-  current.style.opacity = "0";
-  setTimeout(() => {
+  // Force `next` fully hidden *before* touching anything else, with its own
+  // transition briefly suppressed so this snaps instead of animating.
+  // Doesn't assume `next` is already at opacity 0 from a prior cycle's
+  // fade-out — an interrupted prior cycle (dropped frame, tab losing
+  // focus) could leave it at any opacity, and both prompts fading
+  // independently without this could both be visible at once.
+  next.style.transition = "none";
+  next.style.opacity = "0";
+  void next.offsetHeight; // flush so transition:none above actually applies
+  next.style.transition = "";
+
+  // Fade out the visible text, then swap the text underneath and fade the
+  // next one in — but only once the fade-out has *actually* finished
+  // (transitionend), not after a guessed delay. A fallback timeout covers
+  // the case where transitionend never fires at all (e.g. current was
+  // already at 0 for some reason, so setting it to "0" again is a no-op
+  // that triggers no transition).
+  let swapped = false;
+  _promptCycleInFlight = true;
+  function swap() {
+    if (swapped) return;
+    swapped = true;
+    current.removeEventListener("transitionend", swap);
+    clearTimeout(fallback);
     next.textContent = newText;
     next.style.opacity = "1";
     _promptIsCurrent = !_promptIsCurrent;
-    // Reset the faded-out element so it's ready for the next cycle.
-    setTimeout(() => {
-      current.style.opacity = "0";
-    }, 50);
-  }, 500);
+    _promptCycleInFlight = false;
+  }
+  current.addEventListener("transitionend", swap);
+  const fallback = setTimeout(swap, 600);
+  current.style.opacity = "0";
 }
 
 function _removeEmptyChatPrompt() {
@@ -151,11 +249,35 @@ function _removeEmptyChatPrompt() {
   if (existing) existing.remove();
 }
 
+// Keeps the ambient glow (app.css: .chat-panel:has(.empty-chat-prompt)::before)
+// centred on the *text*, not on .chat-panel's own box. The glow is hosted on
+// .chat-panel rather than #messages specifically to escape #messages' own
+// clipping (overflow-y: auto forces overflow-x to compute to auto too, per
+// the CSS Overflow spec, which was cutting off the glow's blur bleed) — but
+// that means its resting position, centred top:0/bottom:0 across the whole
+// of .chat-panel, sits too low by roughly half of whatever height #composer
+// is currently taking, which .empty-chat-prompt's own centring (inside
+// #messages alone) never accounts for.
+//
+// Measured live rather than hardcoded: the composer is always at its
+// baseline (single-line, un-grown) height whenever the empty prompt can
+// even be showing, since that only happens with zero messages — but that
+// baseline height still varies with zoom and window width (the icon/padding
+// tokens it's built from are vw- and zoom-scaled), so it has to be
+// re-measured on the same triggers as every other layout-refresh function,
+// not computed once.
+function _syncEmptyPromptGlow() {
+  var composer = document.querySelector(".composer");
+  if (!composer) return;
+  document.documentElement.style.setProperty("--composer-h", composer.offsetHeight + "px");
+}
+
 function toggleSourcesPanel() {
   const app = document.querySelector(".app");
   const isCollapsed = el.sourcesPanel.classList.toggle("collapsed");
   app.setAttribute("data-sources-panel", isCollapsed ? "collapsed" : "expanded");
   localStorage.setItem("sources-collapsed", isCollapsed ? "1" : "0");
+  _syncDownloadToastLayout();
 
   // Same .settled gate as the sidebar — the hover-to-reveal-toggle behaviour
   // is held off until the 200ms collapse transition finishes.  Without this
@@ -167,6 +289,185 @@ function toggleSourcesPanel() {
     _sourcesSettleTimer = setTimeout(() => {
       el.sourcesPanel.classList.add("settled");
     }, 200);
+  }
+}
+
+// Make the download toasts live in the bottom-right of the Sources (right)
+// rail, inside it, inset evenly from its bottom/left/right edges. Decides
+// whether the rail is too narrow to host the full pill; if so, toggles
+// .compact on the stack (the CSS drops every toast to an icon-only shimmer
+// pill — in every download state), and drops each pill's inline width lock
+// so the fixed 40px .compact pill wins (an inline min-width would keep the
+// stacked pills stuck wide).
+//
+// The stack's width/position come from --sources-w-max (the rail's expanded
+// clamp width), not --sources-w, so a rail that's merely narrower than
+// usual doesn't squeeze the stack below what a non-compact pill needs.
+//
+// This checks the SAME two class conditions app.css keys the rail's own
+// narrowing off (see .sources-panel), rather than measuring the rail's live
+// offsetWidth against a px threshold: the rail's width transitions over
+// 200ms (app.css: .sources-panel), so a synchronous offsetWidth read taken
+// the instant a zoom change fires this function catches the OLD,
+// pre-transition width — one zoom step permanently behind the rail's actual
+// narrow/wide state. Class membership itself isn't animated, so checking it
+// directly is immediate and exact, no transition timing to race.
+function _syncDownloadToastLayout() {
+  var stack = document.getElementById("toast-stack");
+  var shouldCompact = document.documentElement.classList.contains("resp-sources-compact") ||
+    el.sourcesPanel.classList.contains("collapsed");
+  var wasCompact = stack.classList.contains("compact") ||
+    stack.classList.contains("collapsed");
+  stack.classList.toggle("compact", shouldCompact);
+  stack.classList.remove("collapsed");
+  if (!wasCompact && shouldCompact) {
+    var pills = stack.querySelectorAll(".download-toast");
+    for (var i = 0; i < pills.length; i++) pills[i].style.minWidth = "";
+  }
+}
+
+// Keep the composer placeholder from shrinking the input when the window
+// narrows.  The placeholder is forced to a single line (CSS clips it), so a
+// long string would silently truncate; instead swap in the longest of a few
+// variants that actually fits the textarea's current width.  Widths are
+// measured with canvas.measureText (exact, layout-independent) against the
+// textarea's content width, and the placeholder is only written when the
+// chosen string changes, so a resize frame only touches the DOM when it
+// must.
+var _promptPlaceholderVariants = [
+  "Ask a question, or drop a file to add it to this conversation",
+  "Ask a question, or drop a file",
+  "Ask a question",
+];
+// Same placeholder-as-explanation idea as above, but for when a required
+// model is missing (app.css colours it red via .drop-zone.model-blocked),
+// so there's no separate banner element. Unlike _promptPlaceholderVariants,
+// this message is never shortened to fit — it's important enough to stay
+// verbatim, so instead the box itself is resized to whatever the current
+// app size (window width, zoom level) requires (see _updatePromptPlaceholder
+// and the flex-shrink:0 rules in app.css that let that resize actually win
+// over the row's own layout instead of being compressed back down).
+var _modelGatePlaceholderVariants = {
+  both: "No language model or embedding model installed",
+  llm: "No language model installed",
+  embedder: "No embedding model installed",
+};
+var _promptPlaceholderCanvas = null;
+var _promptPlaceholderFontKey = "";
+
+function _promptPlaceholderWidth(text) {
+  if (!_promptPlaceholderCanvas) {
+    _promptPlaceholderCanvas = document.createElement("canvas");
+  }
+  var ctx = _promptPlaceholderCanvas.getContext("2d");
+  var font = getComputedStyle(el.promptInput).font;
+  if (font !== _promptPlaceholderFontKey) {
+    ctx.font = font;
+    _promptPlaceholderFontKey = font;
+  }
+  return ctx.measureText(text).width;
+}
+
+function _updatePromptPlaceholder() {
+  var input = el.promptInput;
+  if (!input) return;
+  var dz = el.dropZone;
+  var blocked = _llmMissing || _embedderMissing;
+  var wasBlocked = dz.classList.contains("model-blocked");
+  // .drop-zone.model-blocked changes both the textarea's flex-grow AND its
+  // own (wider) padding (see app.css) — the two measurements below each
+  // need the state they're actually relevant to, not whatever the class
+  // happens to be right now. rowWidth needs flex-grow OFF (the class
+  // removed) so clientWidth reflects the row's real available space
+  // instead of an arbitrary content-hugging default; padX needs the class
+  // set to whatever `blocked` actually is *this* call, since the padding
+  // that will really eat into the rendered box differs between the two
+  // states — measuring against the wrong one under/over-counts it and
+  // either clips the text or leaves the box needlessly small. All
+  // measured and restored synchronously, so nothing paints in between and
+  // there's no visible flicker.
+  dz.classList.remove("model-blocked");
+  input.style.width = "";
+  var rowWidth = input.clientWidth;
+  dz.classList.toggle("model-blocked", blocked);
+  var padX =
+    (parseInt(getComputedStyle(input).paddingLeft, 10) || 0) +
+    (parseInt(getComputedStyle(input).paddingRight, 10) || 0);
+  dz.classList.toggle("model-blocked", wasBlocked);
+  var avail = rowWidth - padX;
+  // canvas.measureText() slightly under-reports the real DOM-rendered width
+  // (subpixel/hinting differences) — pad by the same proportional margin
+  // the box-sizing step (below) applies, or a string could measure as
+  // "fits" here and then, once padding is added back for the actual box
+  // width, no longer fit after all — clipping the last character or two.
+  function withMargin(w) {
+    return w * 1.04 + 2;
+  }
+  var text;
+  if (blocked) {
+    // Never shortened — see _modelGatePlaceholderVariants. The box is
+    // resized to this text below instead, regardless of `avail`.
+    text =
+      _llmMissing && _embedderMissing
+        ? _modelGatePlaceholderVariants.both
+        : _llmMissing
+        ? _modelGatePlaceholderVariants.llm
+        : _modelGatePlaceholderVariants.embedder;
+  } else {
+    if (avail <= 0) return;
+    text = _promptPlaceholderVariants[_promptPlaceholderVariants.length - 1];
+    for (var i = 0; i < _promptPlaceholderVariants.length; i++) {
+      var w = _promptPlaceholderWidth(_promptPlaceholderVariants[i]);
+      if (withMargin(w) <= avail) {
+        text = _promptPlaceholderVariants[i];
+        break;
+      }
+    }
+  }
+  if (input.placeholder !== text) {
+    input.placeholder = text;
+  }
+  // While a model is missing, the box hugs the warning text instead of
+  // filling the whole composer width — a short message in an otherwise
+  // wide, empty-looking pill read as oversized next to the rest of the
+  // UI. .drop-zone.model-blocked and its textarea (app.css) are both
+  // flex: 0 0 auto so this explicit width always wins: no flex-grow to
+  // pull it back out to fill the row, and no flex-shrink to compress it
+  // back down below what the text needs, however app size or zoom change
+  // the text's rendered width.
+  //
+  // `width` here is a border-box width (this file resets `* { box-sizing:
+  // border-box }`), so it has to include padX or the content area ends up
+  // padX narrower than the text — clipping the last character or two
+  // rather than "hugging" it.
+  //
+  // Capped since the text is never shortened to fit anymore — at a high
+  // enough zoom on a narrow enough window, "No language model or embedding
+  // model installed" can need more room than actually exists. Without a
+  // cap the box would grow unchecked (flex-shrink is 0), pushing the
+  // settings gear off one edge of the window and the pill's own leading
+  // text off the other. Capping lets the *box* stay on-screen and hands
+  // the now-unavoidable overflow to the placeholder's existing CSS
+  // ellipsis/clip (same graceful, contained degradation the ordinary
+  // un-blocked placeholder already falls back to at this extreme).
+  //
+  // The cap is rowWidth (this row's own share of .composer) *plus*
+  // whatever slack .composer itself has left over inside .chat-panel — not
+  // rowWidth alone. .composer is deliberately narrower than the chat
+  // column (64%, see app.css), and a plain rowWidth cap would claw back
+  // that entire deliberate margin, clipping the pill in ordinary cases (a
+  // normal window, no zoom at all). .chat-panel is the real outer
+  // boundary — the fixed sidebar/sources rails live outside it — so
+  // growing into that margin first is safe.
+  if (blocked) {
+    var textWidth = _promptPlaceholderWidth(text);
+    var desired = Math.ceil(withMargin(textWidth)) + padX;
+    var slack =
+      el.chatPanel && el.composer
+        ? Math.max(0, el.chatPanel.clientWidth - el.composer.clientWidth)
+        : 0;
+    var maxSafeWidth = rowWidth + slack;
+    input.style.width = (maxSafeWidth > 0 ? Math.min(desired, maxSafeWidth) : desired) + "px";
   }
 }
 
@@ -320,13 +621,33 @@ function _enterDraftMode() {
   renderConversationList();
 }
 
+var _selectConversationSeq = 0;
+
 async function selectConversation(id) {
   _abortAllSse();
 
+  var seq = ++_selectConversationSeq;
+  // Re-clicking the conversation you're ALREADY viewing must not discard
+  // wherever you'd actually scrolled to — loadMessages() below always ends
+  // with scrollMessagesToBottom(), with no exception for "this is the same
+  // conversation, already open", so capture the current scroll position
+  // here, before it's overwritten, whenever `id` is the conversation
+  // already open. The "different conversation" case is intentionally
+  // untouched — landing at that conversation's own bottom on first open is
+  // the desired default.
+  var preserveScrollTop = id === state.conversationId ? el.messages.scrollTop : null;
   state.conversationId = id;
   _setUrl(id);
   await renderConversationList();
-  await _crossfadeMessages(() => Promise.all([loadMessages(id), loadDocuments(id)]));
+  // Rapid sidebar clicking fires several of these calls concurrently;
+  // loadMessages/loadDocuments' own state.conversationId guard stops the
+  // WRONG conversation's content from being written, but skipping the
+  // fetch entirely here for an already-superseded click also avoids
+  // firing (and then discarding) a request, and an SSE reconnect, for a
+  // conversation the user has already clicked past.
+  if (seq !== _selectConversationSeq) return;
+  await Promise.all([loadMessages(id, preserveScrollTop), loadDocuments(id)]);
+  if (seq !== _selectConversationSeq) return;
   // Ensure the composer is usable even if a background sendMessage in
   // another conversation still has it locked — navigating to a different
   // conversation must not leave the composer dead.
@@ -334,10 +655,18 @@ async function selectConversation(id) {
   _updateSendButton();
 }
 
-async function loadMessages(id) {
+async function loadMessages(id, preserveScrollTop) {
   const response = await api(`/conversations/${id}/messages`);
   const messages = await response.json();
-  _clearMessages();
+  // Rapid sidebar clicking fires several of these concurrently, and nothing
+  // about fetch/await ordering guarantees they resolve in the order they
+  // were called — a slower response for a conversation the user has since
+  // navigated away from can land AFTER a faster response for the one now on
+  // screen, clobbering it with stale content. Bail if we're no longer
+  // looking at `id` by the time this resolves, matching the same guard
+  // reconnectToMessage's poll loop already uses below.
+  if (state.conversationId !== id) return;
+  el.messages.innerHTML = "";
   if (messages.length === 0) {
     _showEmptyChatPrompt();
   }
@@ -356,7 +685,14 @@ async function loadMessages(id) {
       reconnectToMessage(id, message.id, bubble);
     }
   }
-  scrollMessagesToBottom();
+  // undefined/null (a genuinely different conversation) still defaults to
+  // the bottom; 0 is a legitimate scrolled-to-top position and must not be
+  // treated as falsy here.
+  if (preserveScrollTop !== null && preserveScrollTop !== undefined) {
+    el.messages.scrollTop = preserveScrollTop;
+  } else {
+    scrollMessagesToBottom();
+  }
 }
 
 async function reconnectToMessage(conversationId, messageId, bubble) {
@@ -422,83 +758,14 @@ async function reconnectToMessage(conversationId, messageId, bubble) {
 async function loadDocuments(id) {
   const response = await api(`/conversations/${id}/documents`);
   const docs = await response.json();
+  // Same stale-response guard as loadMessages above, and for the same
+  // reason: this conversation's Sources panel must not get overwritten by
+  // a slow-to-resolve fetch for a conversation the user already left.
+  if (state.conversationId !== id) return;
   el.sourcesList.innerHTML = "";
   for (const doc of docs) {
     updateDocumentStatus({ document_id: doc.id, status: doc.status, error_message: doc.error_message }, doc.filename);
   }
-}
-
-// Clears all children from el.messages *except* the crossfade overlay
-// (which is a temporary snapshot positioned absolute — removing it would
-// break the animation).  When no overlay is present this is equivalent
-// to innerHTML = "".
-function _clearMessages() {
-  var overlay = el.messages.querySelector(".messages-crossfade-overlay");
-  while (el.messages.firstChild) {
-    if (el.messages.firstChild === overlay) break;
-    el.messages.removeChild(el.messages.firstChild);
-  }
-}
-
-// Crossfades from old to new messages content.  The overlay captures
-// a snapshot of what was visible, then after the content swap we fade
-// the overlay out while simultaneously fading .messages in — both
-// animate for the same 150ms so the transition reads as one continuous
-// dissolve rather than a jump.
-//
-// The overlay is a direct child of .messages (positioned absolute so it
-// stays out of flex flow); _clearMessages() is careful to leave it
-// alone when loadMessages clears and rebuilds the bubble list.
-function _crossfadeMessages(work) {
-  return new Promise(function (resolve, reject) {
-    var overlay = document.createElement("div");
-    overlay.className = "messages-crossfade-overlay";
-
-    // Snapshot the scroll position so the overlay matches what the user
-    // is looking at rather than always showing the top of the chat.
-    var scrollTop = el.messages.scrollTop;
-
-    var children = el.messages.children;
-    for (var i = 0; i < children.length; i++) {
-      overlay.appendChild(children[i].cloneNode(true));
-    }
-    el.messages.appendChild(overlay);
-    overlay.scrollTop = scrollTop;
-
-    // New content starts invisible so it doesn't flash through at full
-    // opacity while the overlay is still opaque.
-    el.messages.classList.add("crossfading");
-
-    // Force layout so the overlay is painted and .crossfading is applied
-    // before we swap content underneath.
-    overlay.getBoundingClientRect();
-
-    Promise.resolve(work()).then(function () {
-      // Kick off both transitions on the same animation frame:
-      // overlay 1→0, messages 0→1.
-      requestAnimationFrame(function () {
-        overlay.classList.add("fading");
-        el.messages.classList.remove("crossfading");
-      });
-
-      var done = false;
-      function cleanup() {
-        if (done) return;
-        done = true;
-        overlay.removeEventListener("transitionend", cleanup);
-        clearTimeout(fallback);
-        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-        el.messages.classList.remove("crossfading");
-        resolve();
-      }
-      overlay.addEventListener("transitionend", cleanup);
-      var fallback = setTimeout(cleanup, 200);
-    }).catch(function (err) {
-      el.messages.classList.remove("crossfading");
-      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-      reject(err);
-    });
-  });
 }
 
 // -- staged files (pre-submit, client-side only) ---------------------------
@@ -615,14 +882,18 @@ function renderMessage(role, content, citations, status = "done", messageId = nu
       el.promptInput.dispatchEvent(new Event("input"));
     });
   } else {
-    // Assistant bubble — hide it when there's no content yet (queued /
-    // retrieving / generating) so the status text doesn't sit on top of
-    // a visible empty beige box.
+    // Assistant bubble — hide it when there's nothing to show yet (queued /
+    // retrieving / generating) so the status text doesn't sit on top of a
+    // visible empty beige box. Also hide it on error when the backend left
+    // no partial content — otherwise "Error" renders with a hollow bubble
+    // underneath. Error paths that *do* have partial content (or that
+    // substitute a message like "Something went wrong") reveal the box
+    // explicitly, so this default stays hidden until then.
     const bubble = document.createElement("div");
     bubble.className = "message assistant";
     renderMessageContent(contentEl, content, groups);
     bubble.appendChild(contentEl);
-    if (!content && status !== "done" && status !== "error") {
+    if (!content && status !== "done") {
       bubble.style.display = "none";
     }
     wrapper.appendChild(bubble);
@@ -699,7 +970,12 @@ function _stopGeneratingRotation() {
 // Only called once, on the final content of a message (initial load, or
 // the "done" SSE event) — live token streaming still appends raw text
 // directly (see handleMessageEvent's "token" branch) rather than
-// re-parsing markdown on every chunk.
+// re-parsing markdown on every chunk. Streamed text should never actually
+// contain a "[N]"/"[chunk_N]" tag for this to strip in the first place —
+// the backend (src/rag/engine.py's _stream_strip_citation_tags) already
+// removes those from every token before it's ever sent, precisely so
+// nothing here has to reconcile a raw marker appearing live against the
+// differently-numbered citation-marker element "done" renders in its place.
 
 // Underscore italics need a word-boundary guard (unlike `*.*.`) so that
 // snake_case_identifiers — common in this app's own answers — don't get
@@ -920,8 +1196,6 @@ function highlightSource(documentId) {
   const entry = el.sourcesList.querySelector(`[data-document-id="${documentId}"]`);
   if (!entry) return;
   entry.scrollIntoView({ behavior: "smooth", block: "center" });
-  entry.classList.add("highlight");
-  setTimeout(() => entry.classList.remove("highlight"), 1500);
 }
 
 // -- citation modal & PDF viewer ---------------------------------------
@@ -969,6 +1243,31 @@ function openCitationModal(documentId, filename) {
     iframe.src = url;
     iframe.title = filename;
     iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;";
+    // Escape/Enter typed while focus is inside the PDF viewer never reach
+    // document's own keydown listener above — frame boundaries stop DOM
+    // event bubbling regardless of same-origin-ness. A listener on the
+    // iframe's own contentWindow, once loaded, covers both keys via the
+    // same closeCitationModal() the outer listener uses. Reliable in
+    // WebKit (this app's actual Tauri target — the PDF viewer stays in the
+    // same same-origin blob: document there). Chromium-family engines render
+    // their built-in PDF viewer as an internal extension the iframe
+    // effectively navigates to, making it genuinely cross-origin even
+    // from a same-origin blob src — a hard security boundary, not fixable
+    // from page JS — so this is wrapped in try/catch and silently falls
+    // back to the existing document-level handling plus the always
+    // present Close button in that case.
+    iframe.addEventListener("load", () => {
+      try {
+        iframe.contentWindow.addEventListener("keydown", (evt) => {
+          if (evt.key === "Escape" || (evt.key === "Enter" && !evt.shiftKey)) {
+            evt.preventDefault();
+            closeCitationModal();
+          }
+        });
+      } catch (err) {
+        /* cross-origin PDF viewer — can't attach; see comment above */
+      }
+    });
     modalBody.innerHTML = "";
     modalBody.appendChild(iframe);
   });
@@ -1019,7 +1318,10 @@ function updateDocumentStatus(data, filename) {
     entry = document.createElement("div");
     entry.className = "source-entry";
     entry.dataset.documentId = data.document_id;
-    entry.innerHTML = '<span class="source-name"></span><span class="source-status"></span>';
+    entry.innerHTML =
+      '<span class="source-name"></span>' +
+      '<span class="source-initial" aria-hidden="true"></span>' +
+      '<span class="source-status"></span>';
     // Make source entries clickable — opens the citation modal.
     entry.style.cursor = "pointer";
     entry.addEventListener("click", (e) => {
@@ -1032,6 +1334,17 @@ function updateDocumentStatus(data, filename) {
   }
   if (filename) {
     entry.querySelector(".source-name").textContent = filename;
+    // .source-initial is what the compact rail (app.css:
+    // html.resp-sources-compact) shows instead of the full name — every
+    // call site that creates a new entry already has the filename in hand
+    // (see loadDocuments/sendMessage), so this is never left stale for a
+    // freshly created entry the way a later status-only update would be.
+    entry.querySelector(".source-initial").textContent = filename.charAt(0).toUpperCase();
+    // A native tooltip so the filename is still one hover away once the
+    // compact rail hides it — set here rather than unconditionally below
+    // so the error-message title (below) keeps taking priority when both
+    // apply.
+    entry.title = filename;
     if (!_documentMeta[data.document_id]) {
       _documentMeta[data.document_id] = { filename };
     }
@@ -1202,14 +1515,18 @@ function startRename(conversation) {
   };
 }
 
-function _confirmDelete(title) {
+function _confirmDelete(title, verb) {
+  verb = verb || "Delete";
   return new Promise((resolve) => {
     const backdrop = document.getElementById("delete-confirm");
     const message = document.getElementById("confirm-message");
     const cancelBtn = document.getElementById("confirm-cancel");
     const deleteBtn = document.getElementById("confirm-delete");
 
-    message.innerHTML = `Delete <strong>"${title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")}"</strong>?<br>This cannot be undone.`;
+    message.innerHTML =
+        '<p class="confirm-copy">' + _esc(verb) + ' <strong>"' + _esc(title) + '"</strong>?</p>'
+      + '<p class="confirm-subtle">This action cannot be undone.</p>';
+    if (deleteBtn) deleteBtn.textContent = verb;
     backdrop.classList.add("active");
     backdrop.setAttribute("aria-hidden", "false");
     document.body.style.overflow = "hidden";
@@ -1263,20 +1580,50 @@ async function deleteConversationById(conversation) {
 
 // -- sending a message ----------------------------------------------------
 
+// True whenever the composer as a whole must stay grayed out: status not
+// yet confirmed (see _modelStatusReady below) or a required model missing.
+// The textarea and send button are always kept in lock-step on this — there
+// is no "type but can't send" state; _updatePromptPlaceholder names exactly
+// what's missing in the placeholder itself instead of a separate banner.
+function _modelGateBlocked() {
+  return !_modelStatusReady || _llmMissing || _embedderMissing;
+}
+
 function setComposerEnabled(enabled) {
-  el.promptInput.disabled = !enabled;
-  el.sendBtn.disabled = !enabled;
+  var blockedByModel = _modelGateBlocked();
+  var allow = enabled && !blockedByModel;
+  el.promptInput.disabled = !allow;
+  // Attach is driven by blockedByModel alone, not the combined `allow` — it
+  // stays usable during an ordinary in-flight send (queuing the next
+  // upload while one generation is still running is fine and unrelated to
+  // this gate), and the whole pill gets the same muted look (app.css) so
+  // there's no lone active-looking icon inside an otherwise inert box.
+  el.attachBtn.disabled = blockedByModel;
+  el.dropZone.classList.toggle("model-blocked", blockedByModel);
+  if (allow) {
+    _updateSendButton();
+  } else {
+    el.sendBtn.disabled = true;
+  }
 }
 
 function _updateSendButton() {
-  // Never re-enable the button while a send is in flight — the composer
-  // is disabled via setComposerEnabled(false) during the SSE round-trip,
-  // and _updateSendButton (called from addStagedFiles / renderStagedTray)
-  // must not override that.
+  // Never re-enable the button while the textarea itself is disabled —
+  // whether that's the in-flight-send lock (setComposerEnabled(false) in
+  // sendMessage) or the model gate (setComposerEnabled applies
+  // _modelGateBlocked() to both controls together, above). This function
+  // only ever handles the separate "is there text/files to send" concern.
   if (el.promptInput.disabled) return;
   var hasText = el.promptInput.value.trim().length > 0;
   var hasFiles = state.stagedFiles.length > 0;
-  el.sendBtn.disabled = !hasText && !hasFiles;
+  // A brand-new conversation's first message needs a file attached — text
+  // alone isn't enough. Styled as disabled (.gated, matching :disabled's
+  // look) but deliberately NOT the native disabled attribute: a disabled
+  // button fires no click/submit at all, and sendMessage's own guard is
+  // what surfaces the "No attached file" toast on an attempted send.
+  var needsFirstAttachment = !state.conversationId && !hasFiles;
+  el.sendBtn.classList.toggle("gated", needsFirstAttachment);
+  el.sendBtn.disabled = !needsFirstAttachment && !hasText && !hasFiles;
 }
 
 function parseSseEvent(raw) {
@@ -1377,6 +1724,23 @@ function handleMessageEvent(bubble, parsed, citationsRef) {
 async function sendMessage(event) {
   event.preventDefault();
 
+  // The textarea/button are natively disabled whenever _modelGateBlocked()
+  // is true, which already stops a click or Enter-to-submit from reaching
+  // here in the ordinary case — this is a defense-in-depth repeat of that
+  // same check, in case some other path (e.g. a future keyboard shortcut)
+  // calls composer.requestSubmit() without going through a disabled check.
+  if (_modelGateBlocked()) return;
+
+  // A conversation's first message needs a file attached — otherwise
+  // there's nothing to ground an answer in yet. Checked here (not just via
+  // the composer's own disabled state) so an Enter-key submit or a click
+  // on the intentionally-still-clickable .gated send button both surface
+  // the same rejection instead of silently doing nothing.
+  if (!state.conversationId && state.stagedFiles.length === 0) {
+    _showActionToast("No attached file", true);
+    return;
+  }
+
   const prompt = el.promptInput.value.trim();
   if (!prompt && state.stagedFiles.length === 0) return;
 
@@ -1411,6 +1775,9 @@ async function sendMessage(event) {
   // different chat or draft mode while this send was in flight, _enterDraftMode
   // / selectConversation already re-enabled the composer.
   const owningConversationId = state.conversationId;
+  // Marks the window a background model-status refresh (_applyModelGate)
+  // must not clobber — see its own comment for why.
+  _sendInFlight = true;
   setComposerEnabled(false);
 
   const formData = new FormData();
@@ -1456,9 +1823,8 @@ async function sendMessage(event) {
   }
 
   // Rendered immediately, before the network round-trip even starts — this
-  // is the "shows as sent but pending" state; previously nothing appeared
-  // here until the first token streamed back, which on a real model can be
-  // many seconds away.
+  // is the "shows as sent but pending" state, since the first token can be
+  // many seconds away on a real model.
   const assistantBubble = renderMessage("assistant", "", [], "queued");
   const citationsRef = { groups: new Map() };
 
@@ -1537,7 +1903,7 @@ async function sendMessage(event) {
 
     // If the SSE connection fails before we get a single token, surface
     // it on the assistant bubble rather than leaving it stuck on
-    // "Queued…" forever with the composer locked out.
+    // "Queued" forever with the composer locked out.
     setMessageStatus(assistantBubble, "error");
     const contentEl = assistantBubble.querySelector(".bubble-content");
     if (contentEl && !contentEl.textContent.trim()) {
@@ -1549,6 +1915,7 @@ async function sendMessage(event) {
     }
   } finally {
     state.activeSseControllers.delete(controller);
+    _sendInFlight = false;
   }
 
   // Only re-enable the composer if we're still viewing the conversation
@@ -1600,6 +1967,7 @@ function openSearchPopup() {
     overlay.classList.remove("active");
     overlay.setAttribute("aria-hidden", "true");
     input.removeEventListener("input", onInput);
+    input.removeEventListener("keydown", onInputKeyDown);
     closeBtn.removeEventListener("click", close);
     overlay.removeEventListener("click", onOverlayClick);
     document.removeEventListener("keydown", onKeyDown);
@@ -1687,6 +2055,20 @@ function _renderSearchResults(query) {
   }
 }
 
+// True whenever a modal/overlay is currently shown — used to gate new
+// shortcuts that would otherwise act (or open) invisibly behind/under
+// whatever's already on top, or double-fire while something's already open.
+function _anyOverlayActive() {
+  return (
+    document.getElementById("citation-modal").classList.contains("active") ||
+    document.getElementById("search-overlay").classList.contains("active") ||
+    document.getElementById("rename-overlay").classList.contains("active") ||
+    document.getElementById("settings-overlay").classList.contains("active") ||
+    document.getElementById("delete-confirm").getAttribute("aria-hidden") === "false" ||
+    document.getElementById("restart-confirm").getAttribute("aria-hidden") === "false"
+  );
+}
+
 // Close context menu or citation modal on Escape.
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
@@ -1699,7 +2081,20 @@ document.addEventListener("keydown", (e) => {
       renameOverlay.classList.remove("active");
       renameOverlay.setAttribute("aria-hidden", "true");
     }
-    closeContextMenu();
+    // When the restart-confirm modal is stacked above Settings, a single
+    // Escape should dismiss only the topmost popup (the modal) — never
+    // also close Settings and drop straight back to chat. The modal owns
+    // its own Escape handling, so skip Settings/context-menu here.
+    const restartModal = document.getElementById("restart-confirm");
+    const restartActive =
+      restartModal && restartModal.classList.contains("active");
+    if (!restartActive) {
+      const settingsOverlay = document.getElementById("settings-overlay");
+      if (settingsOverlay && settingsOverlay.classList.contains("active")) {
+        closeSettings();
+      }
+      closeContextMenu();
+    }
   }
   // Global Enter-to-submit: when the user hasn't clicked into the textarea
   // but there's content ready to send (staged files or typed text), Enter
@@ -1707,11 +2102,21 @@ document.addEventListener("keydown", (e) => {
   // focus is in another input (search popup, rename dialog) or when a
   // modal/overlay is open.
   if (e.key === "Enter" && !e.shiftKey) {
+    // Enter closes the citation-preview modal if it's open, same as
+    // Escape does above — checked first, so this can't also fall through
+    // to the submit logic below on the same keypress.
+    var citationModal = document.getElementById("citation-modal");
+    if (citationModal.classList.contains("active")) {
+      e.preventDefault();
+      closeCitationModal();
+      return;
+    }
     if (el.promptInput.disabled) return;
     var tag = document.activeElement ? document.activeElement.tagName : "";
     if (tag === "INPUT" || tag === "TEXTAREA") return;
     if (document.getElementById("search-overlay").classList.contains("active")) return;
     if (document.getElementById("rename-overlay").classList.contains("active")) return;
+    if (document.getElementById("settings-overlay").classList.contains("active")) return;
     if (document.getElementById("delete-confirm").getAttribute("aria-hidden") === "false") return;
     var hasText = el.promptInput.value.trim().length > 0;
     var hasFiles = state.stagedFiles.length > 0;
@@ -1720,7 +2125,85 @@ document.addEventListener("keydown", (e) => {
       el.composer.requestSubmit();
     }
   }
+  // Manual zoom (Cmd/Ctrl +/-/0) — see _setZoomIndex above. Deliberately no
+  // input-focus guard (unlike the Enter-to-submit block above): a browser's
+  // own Cmd+Plus/Minus/0 works regardless of what's focused, and this
+  // should match that.
+  if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+" || e.code === "NumpadAdd")) {
+    e.preventDefault();
+    _setZoomIndex(_zoomIndex + 1);
+  }
+  if ((e.metaKey || e.ctrlKey) && (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract")) {
+    e.preventDefault();
+    _setZoomIndex(_zoomIndex - 1);
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+    e.preventDefault();
+    _setZoomIndex(_ZOOM_DEFAULT_INDEX);
+  }
+
+  // Cmd/Ctrl+F — open chat search. Guarded: search-overlay's z-index (100)
+  // sits below citation-modal/delete-confirm/restart-confirm (150), so
+  // opening it under one of those would render invisibly and steal focus
+  // into a hidden input; re-opening while already active would stack a
+  // second set of listeners (openSearchPopup has no existing-instance guard).
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    if (!_anyOverlayActive()) openSearchPopup();
+  }
+
+  // Cmd/Ctrl+N — new chat, same as clicking "New chat". createConversation()
+  // already no-ops in draft mode; guarded on _anyOverlayActive() too so a
+  // stray keystroke can't reset the current chat underneath an open dialog.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
+    e.preventDefault();
+    if (!_anyOverlayActive()) createConversation();
+  }
+
+  // Cmd/Ctrl+P — pin/unpin the current conversation. No-op in draft mode.
+  // togglePin() needs a full conversation object (.id, .pinned), not just
+  // the id string in state.conversationId, and nothing in the app caches
+  // conversation objects — fetch fresh via the single-row GET (exists
+  // server-side already) rather than adding a new cache that could drift
+  // out of sync with pin state changed elsewhere. Not gated on
+  // _anyOverlayActive(): this only does a background PATCH + sidebar
+  // re-render, no z-index/focus contention with anything.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "p") {
+    e.preventDefault();
+    if (state.conversationId) {
+      api(`/conversations/${state.conversationId}`)
+        .then((response) => response.json())
+        .then((conversation) => togglePin(conversation))
+        .catch(() => {}); // conversation may have been deleted elsewhere
+    }
+  }
 });
+
+// Mouse-wheel scroll landing in the empty grid gutters (the leftover space
+// between a collapsed/narrower sidebar or sources panel and the fixed-width
+// centered chat column — see .app's grid-template-columns) or the slack
+// within .chat-panel itself (#messages' own max-width is often narrower
+// than --chat-w) did nothing: neither .app, .chat-panel, nor body
+// (overflow: hidden) are scrollable, and nothing forwarded the input to
+// #messages, the only thing actually worth scrolling there. Only acts when
+// the wheel event's target is exactly one of these two background
+// containers — never a more specific child (sidebar list, sources list,
+// composer, modals, #messages itself, ...), so every existing scrollable
+// region keeps its own native behavior untouched.
+(function () {
+  var appEl = document.querySelector(".app");
+  var chatPanelEl = document.querySelector(".chat-panel");
+  document.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.target === appEl || e.target === chatPanelEl) {
+        el.messages.scrollTop += e.deltaY;
+      }
+    },
+    { passive: true }
+  );
+})();
+
 el.composer.addEventListener("submit", sendMessage);
 document.getElementById("citation-modal").addEventListener("click", (e) => {
   if (e.target === e.currentTarget) closeCitationModal();
@@ -1769,7 +2252,15 @@ el.fileInput.addEventListener("change", () => {
 });
 // Clicking anywhere in the drop-zone (including its padding) focuses
 // the textarea — without this the user has to hit the text node itself.
+// While a required model is missing, the whole (shrink-to-fit, inert)
+// pill instead opens Settings on click — checked first and unconditional
+// on e.target, so it fires for a click anywhere in the pill, including on
+// the disabled textarea/attach/send children, not just its own padding.
 el.dropZone.addEventListener("click", (e) => {
+  if (_llmMissing || _embedderMissing) {
+    openSettings();
+    return;
+  }
   if (e.target === el.dropZone) {
     el.promptInput.focus();
   }
@@ -1782,12 +2273,25 @@ el.promptInput.addEventListener("keydown", (event) => {
   }
 });
 
+// Auto-grow the textarea so every line is visible (max-height: 160px in
+// CSS caps it, at which point the textarea scrolls internally). Pulled out
+// of the "input" listener below so a resize/zoom change can also re-run
+// it — scrollHeight depends on both the current font-size (root font-size
+// is zoom- and window-width-responsive, see app.css) and the textarea's
+// own width (a narrower box wraps onto more lines); without re-running
+// this on those changes too, existing multi-line text keeps whatever pixel
+// height was set the last time it was actually typed into, so the box can
+// end up visibly too tall or too short for its own text after a resize.
+function _updateTextareaHeight() {
+  var input = el.promptInput;
+  if (!input || !input.value) return; // empty box is sized by CSS, not this
+  input.style.height = "auto";
+  input.style.height = input.scrollHeight + "px";
+}
+
 el.promptInput.addEventListener("input", () => {
   _updateSendButton();
-  // Auto-grow the textarea so every line is visible (max-height: 160px
-  // in CSS caps it, at which point the textarea scrolls internally).
-  el.promptInput.style.height = "auto";
-  el.promptInput.style.height = el.promptInput.scrollHeight + "px";
+  _updateTextareaHeight();
 });
 
 for (const eventName of ["dragenter", "dragover"]) {
@@ -1808,125 +2312,6 @@ el.dropZone.addEventListener("drop", (event) => {
   }
 });
 
-// -- speech-to-text (Web Speech API, hold to speak) ----------------------
-
-el.micBtn = document.getElementById("mic-btn");
-let _recognition = null;
-let _isRecording = false;
-var _micRetries = 0;
-var _MIC_MAX_RETRIES = 5;
-
-function _initSpeechRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    el.micBtn.style.display = "none";
-    return;
-  }
-  _recognition = new SpeechRecognition();
-  _recognition.continuous = true;
-  _recognition.interimResults = true;
-  _recognition.lang = "en-US";
-
-  _recognition.addEventListener("result", (event) => {
-    _micRetries = 0; // successful recognition — reset the retry counter
-    let transcript = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      transcript += event.results[i][0].transcript;
-    }
-    el.promptInput.value = transcript;
-    el.promptInput.dispatchEvent(new Event("input"));
-  });
-
-  _recognition.addEventListener("error", (event) => {
-    // "network" means the browser can't reach Google's speech servers
-    // at all — this is persistent (offline, Brave shields, firewall),
-    // not transient.  Stop immediately so the user sees the feedback.
-    if (event.error === "network") {
-      console.warn("Speech recognition unavailable: cannot reach speech servers. "
-        + "Check your internet connection and whether Brave shields are blocking it.");
-      el.micBtn.classList.add("recording"); // brief red flash
-      el.micBtn.title = "Dictation unavailable — speech servers unreachable";
-      _stopRecording();
-      setTimeout(function() { el.micBtn.title = "Dictate"; }, 3000);
-      return;
-    }
-    // Hard failures — no recovery possible.
-    if (event.error === "not-allowed" || event.error === "audio-capture"
-        || event.error === "service-not-allowed") {
-      console.warn("Speech recognition error:", event.error);
-      _stopRecording();
-      return;
-    }
-    // "no-speech" and "aborted" are transient — the "end" handler
-    // restarts, capped by _micRetries to avoid an infinite loop.
-  });
-
-  _recognition.addEventListener("end", () => {
-    if (_isRecording) {
-      _micRetries++;
-      if (_micRetries > _MIC_MAX_RETRIES) {
-        console.warn("Speech recognition: giving up after " + _MIC_MAX_RETRIES + " retries");
-        _stopRecording();
-        return;
-      }
-      try {
-        _recognition.start();
-      } catch {
-        // ignore — may already be starting
-      }
-    } else {
-      el.micBtn.classList.remove("recording");
-    }
-  });
-}
-
-function _startRecording() {
-  if (!_recognition) return;
-  _isRecording = true;
-  _micRetries = 0;
-  el.micBtn.classList.add("recording");
-  el.micBtn.title = "Stop dictating";
-  console.log("mic: starting");
-  try {
-    _recognition.start();
-  } catch {
-    // already started
-  }
-}
-
-function _stopRecording() {
-  _isRecording = false;
-  _micRetries = 0;
-  el.micBtn.classList.remove("recording");
-  el.micBtn.title = "Dictate";
-  console.log("mic: stopping");
-  try {
-    _recognition.stop();
-  } catch {
-    // already stopped
-  }
-}
-
-// Toggle: first click starts, second click stops and sends.
-el.micBtn.addEventListener("click", () => {
-  if (_isRecording) {
-    _stopRecording();
-    el.composer.requestSubmit();
-  } else {
-    _startRecording();
-  }
-});
-
-// If the user presses Enter or clicks Send while the mic is still
-// recording, stop it first so the sent message captures the full
-// transcript.
-el.composer.addEventListener("submit", (event) => {
-  if (_isRecording) {
-    _stopRecording();
-  }
-}, { capture: true });
-
-_initSpeechRecognition();
 
 // -- global drag-and-drop -----------------------------------------------
 
@@ -1983,9 +2368,12 @@ window.addEventListener("drop", (event) => {
 // content for the entire animation and only collapse at the very end.
 //
 // This function runs on every animation frame of a resize (via rAF),
-// updating --sidebar-w/--sources-w custom properties the moment the
+// updating --sidebar-w (and toggling the resp-* classes) the moment the
 // threshold is crossed — so the collapse is instant regardless of
-// animation speed.
+// animation speed. The Sources rail has no equivalent JS-computed width:
+// --sources-w is driven entirely by the CSS cascade (see :root and the
+// resp-sources-compact/collapsed overrides in app.css), on purpose — see
+// _syncDownloadToastLayout for why it must stay that way.
 //
 // For the sidebar we add .collapsed directly (rather than a parallel
 // resp-* class) so EVERY existing .sidebar.collapsed CSS rule fires —
@@ -1996,14 +2384,20 @@ window.addEventListener("drop", (event) => {
 var _responsiveSidebarCollapsed = false;
 
 function _applyResponsiveState() {
-  var w = window.innerWidth;
+  // Divide by the current zoom multiplier so the threshold tracks the
+  // *effective* footprint of the fixed sidebar/sources rails, not just the
+  // raw window: zoom inflates their rendered width (see app.css's --zoom)
+  // without changing window.innerWidth or firing `resize` — without this,
+  // zooming in on an otherwise-roomy window could let the two fixed rails'
+  // combined reserved width exceed the window itself.
+  var zoom = ZOOM_LEVELS[_zoomIndex];
+  var w = window.innerWidth / zoom;
   var html = document.documentElement;
 
   if (w <= 900) {
-    html.style.setProperty("--sources-w", "0");
-    html.classList.add("resp-sources-hidden");
+    html.classList.add("resp-sources-compact");
 
-    html.style.setProperty("--sidebar-w", "64px");
+    html.style.setProperty("--sidebar-w", (64 * zoom) + "px");
     html.classList.add("resp-sidebar-collapsed");
     if (!el.sidebar.classList.contains("collapsed")) {
       el.sidebar.classList.add("collapsed");
@@ -2014,8 +2408,7 @@ function _applyResponsiveState() {
     // expanding is pointless at this width.
     el.sidebar.classList.remove("settled");
   } else {
-    html.style.removeProperty("--sources-w");
-    html.classList.remove("resp-sources-hidden");
+    html.classList.remove("resp-sources-compact");
 
     html.style.removeProperty("--sidebar-w");
     html.classList.remove("resp-sidebar-collapsed");
@@ -2048,6 +2441,10 @@ window.addEventListener("resize", function () {
     _resizeRAF = requestAnimationFrame(function () {
       _resizeRAF = null;
       _applyResponsiveState();
+      _syncDownloadToastLayout();
+      _updatePromptPlaceholder();
+      _updateTextareaHeight();
+      _syncEmptyPromptGlow();
     });
   }
 });
@@ -2088,6 +2485,14 @@ window.addEventListener("resize", function () {
   // sidebars even for a single frame.
   _applyResponsiveState();
 
+  // Set the toast stack's compact/width state now that both panels are in
+  // their final pre-paint state, and size the composer placeholder to the
+  // current width so a narrow window never shows the long text clipped.
+  _syncDownloadToastLayout();
+  _updatePromptPlaceholder();
+  _updateTextareaHeight();
+  _syncEmptyPromptGlow();
+
   await renderConversationList();
 
   const conversationId = _conversationIdFromPath();
@@ -2100,4 +2505,1085 @@ window.addEventListener("resize", function () {
   }
 
   _updateSendButton();
+  _checkModelStatus();
 })();
+
+el.settingsBtn.addEventListener("click", openSettings);
+
+// ── model status & settings popup ──────────────────────────────────────
+
+var _dropdownDocBound = false;
+
+function _esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Cached /api/models/status so opening Settings renders the model sections
+// immediately instead of flashing a "Loading…" placeholder that then expands
+// once the fetch returns. Kept current by refreshes on open and after downloads.
+var _cachedModelStatus = null;
+var _llmMissing = false;
+var _embedderMissing = false;
+// True once the *first* /api/models/status attempt (success or failure) has
+// completed. Until then, _modelGateBlocked() (see setComposerEnabled) holds
+// the composer disabled with no banner shown, rather than optimistically
+// treating an unconfirmed default as "available".
+var _modelStatusReady = false;
+// True for the span of an in-flight send (see sendMessage) — guards
+// _applyModelGate's background refreshes from clobbering that lock.
+var _sendInFlight = false;
+
+async function _fetchModelStatus() {
+  var data = null;
+  try {
+    var resp = await fetch("/api/models/status");
+    if (resp.ok) data = await resp.json();
+  } catch (_) {
+    // Best-effort — don't break the app if the endpoint fails.
+  }
+  _modelStatusReady = true;
+  if (data) {
+    _cachedModelStatus = data;
+    var anyMissing = (!data.available || data.available.length === 0);
+    if (anyMissing) {
+      el.settingsBtn.classList.add("warning");
+    } else {
+      el.settingsBtn.classList.remove("warning");
+    }
+    // Block sending entirely when a real driver is configured but no model
+    // is downloaded/selected for that role. Mock mode needs no files, so it
+    // stays enabled. Both roles are checked independently — an LLM present
+    // with no embedding model (or vice versa) still blocks sending, since
+    // RagEngine.answer() needs both to produce a grounded answer.
+    _llmMissing = data.llm_driver === "llama_cpp" && !data.active_llm;
+    _embedderMissing = data.embedder === "llama_cpp" && !data.active_embedding;
+  }
+  // On a failed fetch there's no fresh data, so this just re-applies
+  // whatever _llmMissing/_embedderMissing last held (their initial false
+  // defaults, on the very first attempt) — never leaves the composer stuck
+  // on the "status still loading" hold forever.
+  _applyModelGate();
+  return data;
+}
+
+// Reflects current model availability in the composer: both the textarea
+// and send button grayed out together while blocked, with the placeholder
+// itself naming exactly what's missing (see _updatePromptPlaceholder) —
+// there's no "type but can't send" state, and no separate banner; the
+// blocked textarea's own placeholder is the explanation. File
+// attach/ingestion stays available either way (untouched by this gate).
+function _applyModelGate() {
+  // Harmless to call unconditionally (unlike setComposerEnabled below):
+  // neither writes anything but the placeholder/width/height of an
+  // (at most) empty-of-real-content box, never the in-flight send lock,
+  // so neither can clobber it. _updateTextareaHeight matters here too, not
+  // just on resize — the shrink-to-fit width _updatePromptPlaceholder just
+  // applied can drastically change how any already-typed text wraps.
+  _updatePromptPlaceholder();
+  _updateTextareaHeight();
+  // Guarded so a background refresh (closeSettings, window focus while
+  // Settings is open, post-download/-delete) can't clobber an in-flight
+  // send's own lock — none of those triggers are themselves blocked by an
+  // in-flight generation, and promptInput.disabled during a send is *only*
+  // ever set by sendMessage()'s lock. Forcing it back to enabled here mid-
+  // generation would let a second send fire before the first one finishes —
+  // exactly the double-send failure mode this app's backend was redesigned
+  // around (see GenerationWorker in ARCHITECTURE.md). sendMessage() restores
+  // the composer itself once the stream ends.
+  if (!_sendInFlight) {
+    setComposerEnabled(true);
+  }
+}
+
+async function _checkModelStatus() {
+  await _fetchModelStatus();
+}
+
+// A cheap fingerprint of the parts of /api/models/status the settings panel
+// renders, used to decide whether a re-render is actually needed on a refresh
+// (avoiding a flicker when nothing on disk changed).
+function _modelStatusSignature(data) {
+  if (!data) return "";
+  return JSON.stringify([
+    data.available,
+    data.types,
+    data.active_llm,
+    data.active_embedding,
+    data.models,
+  ]);
+}
+
+// The models folder is user-editable — a file can be dropped in or deleted
+// from Finder while Settings is open. Refresh the panel whenever the window
+// regains focus (e.g. returning from the OS file manager) so the dropdowns
+// and active-model names reflect the folder's real contents.
+window.addEventListener("focus", function () {
+  var overlay = document.getElementById("settings-overlay");
+  if (!overlay || !overlay.classList.contains("active")) return;
+  _fetchModelStatus().then(function (data) {
+    if (data) _renderSettingsBody(data);
+  });
+});
+
+function closeSettings() {
+  var overlay = document.getElementById("settings-overlay");
+  if (!overlay) return;
+  overlay.classList.remove("active");
+  overlay.setAttribute("aria-hidden", "true");
+  _collapseAllDropdowns();
+  // Deliberately do NOT abort an in-flight model download here. Aborting
+  // leaves a partial `.incomplete` file in huggingface_hub's cache that never
+  // becomes a usable model, and the progress bar/stream would just vanish —
+  // appearing to the user as "the download never happened." Letting it finish
+  // in the background is safe: _refreshAfterDownload runs with the overlay
+  // hidden and the next open of Settings (or the gear warning check) reflects
+  // the installed model.
+  // Refresh the send button's model gate now, in case a download/delete
+  // happened while Settings was open and closed itself (rather than via
+  // _refreshAfterDownload) — e.g. deleting the last active model then
+  // dismissing the panel without triggering another download.
+  _fetchModelStatus();
+}
+
+function openSettings() {
+  var overlay = document.getElementById("settings-overlay");
+  var closeBtn = document.getElementById("settings-close");
+  if (!overlay || !closeBtn) return;
+
+  overlay.classList.add("active");
+  overlay.setAttribute("aria-hidden", "false");
+
+  // Render immediately from the cached model status so the model sections are
+  // fully drawn when the popup appears (no "Loading…" placeholder that then
+  // expands). Refresh in the background so a later open is up to date.
+  if (_cachedModelStatus) {
+    _renderSettingsBody(_cachedModelStatus);
+    _fetchModelStatus().then(function (data) {
+      if (data) _renderSettingsBody(data);
+    });
+  } else {
+    _renderSettingsBody();
+  }
+
+  function close() {
+    closeSettings();
+    closeBtn.removeEventListener("click", close);
+    overlay.removeEventListener("click", onOverlayClick);
+    document.removeEventListener("keydown", onKeyDown);
+  }
+
+  function onOverlayClick(e) {
+    if (e.target === overlay) close();
+  }
+
+  function onKeyDown(e) {
+    // A restart-confirm modal sits above Settings — let its own Escape
+    // handler dismiss it first; don't also close Settings here.
+    const restartModal = document.getElementById("restart-confirm");
+    if (restartModal && restartModal.classList.contains("active")) return;
+    if (e.key === "Escape") close();
+  }
+
+  closeBtn.addEventListener("click", close);
+  overlay.addEventListener("click", onOverlayClick);
+  document.addEventListener("keydown", onKeyDown);
+}
+
+async function _renderSettingsBody(data) {
+  var body = document.getElementById("settings-body");
+  if (!body) return;
+
+  // No data passed in: fetch it now (first open before the cache is warm).
+  if (!data) {
+    try {
+      var resp = await fetch("/api/models/status");
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      data = await resp.json();
+      _cachedModelStatus = data;
+    } catch (_) {
+      body.innerHTML = '<div class="settings-error">Could not load model status.</div>';
+      return;
+    }
+  }
+
+  var html = "";
+
+  // Capability hint. We don't list the raw driver names ("LLM driver:
+  // mock") because they can't be changed here — instead we surface only
+  // what the user can act on: mock mode means the selection below has no
+  // effect.
+  var mockMode = data.llm_driver === "mock" || data.embedder === "mock";
+  if (mockMode) {
+    html += _noticeHtml('Mock mode — models aren’t loaded. Set '
+      + '<code>LLM_DRIVER=llama_cpp</code> and <code>EMBEDDER=llama_cpp</code> '
+      + 'in <code>.env</code> to use your selection.');
+  }
+
+  // Find the known catalog entry per role (for the "download default" action).
+  // Build a filename -> type map for *every* available file so the menus show
+  // only models of the matching kind (an embedding GGUF must never appear in
+  // the LLM menu). The backend classifies each file from its GGUF metadata
+  // (pooling-layer presence), so third-party models get the right type too.
+  var llmCat = null, embCat = null, typeByName = {};
+  for (var c = 0; c < data.models.length; c++) {
+    if (data.models[c].key === "llm") llmCat = data.models[c];
+    if (data.models[c].key === "embedding") embCat = data.models[c];
+  }
+  if (data.types && typeof data.types === "object") {
+    for (var name in data.types) {
+      if (Object.prototype.hasOwnProperty.call(data.types, name)) {
+        typeByName[name] = data.types[name];
+      }
+    }
+  }
+
+  html += _modelCardHtml("Language model", "llm", data.available, data.active_llm, typeByName, llmCat);
+  html += _modelCardHtml("Embedding model", "embedding", data.available, data.active_embedding, typeByName, embCat);
+
+  html += '<button type="button" class="settings-open-folder-btn" id="open-models-folder">'
+    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>'
+    + '<span>Open models folder</span>'
+    + '</button>';
+
+  body.innerHTML = html;
+
+  // Wire model dropdown triggers
+  var triggers = body.querySelectorAll(".settings-dropdown-trigger");
+  for (var j = 0; j < triggers.length; j++) {
+    triggers[j].addEventListener("click", function () {
+      _toggleModelDropdown(this);
+    });
+  }
+
+  // Wire model options (select a model). Only the real, on-disk candidate rows
+  // are selectable: they are the <button> options carrying a data-filename.
+  // The not-yet-downloaded catalog-default row is a <button> too, but it has
+  // no data-filename (it can't be picked until it's on disk) — it's a
+  // download action wired separately below, so it stays out of this set.
+  var options = body.querySelectorAll("button.settings-dropdown-option[data-filename]:not([disabled])");
+  for (var o = 0; o < options.length; o++) {
+    options[o].addEventListener("click", function () {
+      _selectModel(this.dataset.role, this.dataset.filename);
+    });
+  }
+
+  // Wire the "open models folder" button
+  var openBtn = body.querySelector(".settings-open-folder-btn");
+  if (openBtn) openBtn.addEventListener("click", _openModelsFolder);
+
+  // Wire download rows (the catalog-default row is one whole download button)
+  var buttons = body.querySelectorAll(".settings-dropdown-option-download");
+  for (var k = 0; k < buttons.length; k++) {
+    buttons[k].addEventListener("click", function () {
+      var key = this.dataset.modelKey;
+      var name = this.dataset.name || null;
+      _startModelDownload(key, name);
+    });
+  }
+
+  // Wire delete buttons (one per installed model: the active model on the
+  // trigger row, and each non-active downloaded model in the dropdown).
+  var deletes = body.querySelectorAll(".settings-model-delete");
+  for (var d = 0; d < deletes.length; d++) {
+    deletes[d].addEventListener("click", function () {
+      _deleteModel(this.dataset.deleteTarget);
+    });
+  }
+}
+
+// A single muted warning banner (icon + message). `inner` is trusted markup
+// built from string literals only — never pass user input through here.
+function _noticeHtml(inner) {
+  return '<div class="settings-notice">'
+    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M12 9v4"/><path d="M12 17h.01"/>'
+    + '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>'
+    + '<span>' + inner + '</span>'
+    + '</div>';
+}
+
+// Hand-authored trash glyph (no icon font/CDN).
+function _trashGlyph() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+}
+
+// Checkmark marking the currently-selected model in the dropdown.
+function _checkGlyph() {
+  return '<svg class="settings-dropdown-option-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+}
+
+// A small uninstall button for an installed model (default or custom).
+function _deleteButtonHtml(target) {
+  return '<button type="button" class="settings-model-delete" data-delete-target="' + _esc(target) + '" title="Uninstall model" aria-label="Uninstall ' + _esc(target) + '">'
+    + _trashGlyph()
+    + '</button>';
+}
+
+// Uninstall an installed model, reusing the chat-delete confirmation modal.
+async function _deleteModel(target) {
+  var confirmed = await _confirmDelete(target, "Uninstall");
+  if (!confirmed) return;
+  try {
+    var resp = await fetch("/api/models/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: target })
+    });
+    if (!resp.ok) {
+      var err = {};
+      try { err = await resp.json(); } catch (_) {}
+      throw new Error(err.detail || "HTTP " + resp.status);
+    }
+  } catch (err) {
+    console.warn("delete model failed:", err);
+  }
+  _refreshAfterDownload();
+}
+
+
+function _modelCardHtml(label, role, available, active, typeByName, cat) {
+  // Options: every .gguf of the matching type (role), INCLUDING the currently
+  // active one (marked with a checkmark so it's clear it's selected). Filtering
+  // by type keeps an embedding GGUF out of the LLM menu and vice versa.
+  var opts = [];
+  for (var i = 0; i < available.length; i++) {
+    var f = available[i];
+    if (!typeByName[f] || typeByName[f] === role) opts.push(f);
+  }
+  opts.sort();
+
+  var canDownload = !!(cat && !cat.exists && cat.repo_id);
+  // With no downloaded candidates and nothing to download, the trigger is a
+  // dead button — disable it so it reads as a label, not a clickable control.
+  var nothingToSelect = opts.length === 0 && !canDownload;
+  var disabledAttr = nothingToSelect ? ' disabled' : '';
+  // Nothing downloaded for this role at all yet — the same condition that
+  // drives the composer's "No language/embedding model installed" gate
+  // (app.js: _updatePromptPlaceholder). Flags the card so its background
+  // and the "Select a model..." placeholder read as a warning, not just an
+  // empty default state.
+  var missingClass = opts.length === 0 ? ' missing' : '';
+
+  var html = '<div class="settings-model-card' + missingClass + '">';
+  html += '<p class="settings-model-name">' + _esc(label) + '</p>';
+  html += '<div class="settings-model-trigger-row">';
+  html += '<button type="button" class="settings-dropdown-trigger" data-role="' + _esc(role) + '" data-active="' + _esc(active || '') + '" aria-haspopup="listbox" aria-expanded="false"' + disabledAttr + '>';
+  html += '<span class="settings-dropdown-value" id="value-' + _esc(role) + '">'
+    + (active ? _esc(active) : 'Select a model...') + '</span>';
+  html += '<svg class="settings-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+  html += '</button>';
+  html += '</div>';
+  html += '<div class="settings-dropdown-list" id="list-' + _esc(role) + '" role="listbox" hidden>';
+  if (opts.length === 0 && !canDownload) {
+    html += '<div class="settings-dropdown-empty">No other models available</div>';
+  } else {
+    for (var i = 0; i < opts.length; i++) {
+      var f = opts[i];
+      var isActive = f === active;
+      html += '<div class="settings-dropdown-option-row">';
+      html += '<button type="button" class="settings-dropdown-option settings-dropdown-option-select"'
+        + ' data-role="' + _esc(role) + '" data-filename="' + _esc(f) + '"'
+        + ' role="option"' + (isActive ? ' aria-selected="true"' : '') + '>';
+      if (isActive) html += _checkGlyph();
+      html += '<span class="settings-dropdown-option-name">' + _esc(f) + '</span>';
+      html += '</button>';
+      html += _deleteButtonHtml(f);
+      html += '</div>';
+    }
+    if (canDownload) {
+      // The catalog default isn't on disk yet — offer it as a row that is
+      // itself one whole download button (the only model type the backend can
+      // fetch), rather than a one-off "download default" button in the card
+      // foot. Being a single <button>, every pixel of it — padding included —
+      // is clickable and the row stays the same height as a plain option.
+      html += '<button type="button" class="settings-dropdown-option settings-dropdown-option-download" data-model-key="' + _esc(role) + '" data-name="' + _esc(cat.filename) + '" data-lock-key="' + _esc(role) + '"'
+        + ' title="Download ' + _esc(cat.filename) + '" aria-label="Download ' + _esc(cat.filename) + '">';
+      html += '<span class="settings-dropdown-option-name">' + _esc(cat.filename) + '</span>';
+      // Hand-authored download-into-tray glyph so the row needs no icon font/CDN.
+      // Sized below the text line-height so it never inflates the row either.
+      html += '<svg class="settings-download-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>';
+      html += '</button>';
+    }
+  }
+  html += '</div>';
+  // Card foot: a quiet status line for the select/restart flow ("Saving…",
+  // "Restarting…", errors). The download progress now lives in the toast,
+  // so no download button lives here anymore.
+  html += '<div class="settings-model-foot">';
+  html += '<span class="settings-model-note" id="note-' + _esc(role) + '"></span>';
+  html += '</div>';
+  html += '</div>';
+  return html;
+}
+
+// Selecting a model persists the choice but it only takes effect after the
+// backend restarts. So clicking an option asks for confirmation first: on
+// confirm we persist + quit (the new model loads next launch); on cancel we
+// revert the dropdown to the currently-active model and persist nothing.
+// No transient "Saved" note — the restart prompt *is* the confirmation.
+function _selectModel(role, filename) {
+  var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
+  var current = trigger ? (trigger.dataset.active || "") : "";
+
+  // Close the dropdown before showing the modal — the list's high z-index
+  // would otherwise float it above the confirm-backdrop.
+  var list = document.getElementById("list-" + role);
+  _closeDropdownList(list, trigger, true);
+
+  if (filename === current) {
+    // Clicking the already-active model is a no-op — just close.
+    return;
+  }
+
+  // The modal drives the restart action (and the loading state) itself;
+  // this callback only runs on the cancel path — revert to current.
+  _confirmRestart(role, filename, function () {
+    _updateDropdownValue(role, current || "");
+  });
+}
+
+function _updateCurrentActive(role, filename) {
+  var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
+  if (trigger) trigger.dataset.active = filename || "";
+}
+
+// Lock the restart modal into a non-dismissible "restarting" state: disable
+// both buttons, swap the Restart label for a clockwise spinner in-place (its
+// box is kept, so the button doesn't reflow), disable Escape/backdrop
+// dismissal, and gray out the Settings "x". The confirm message text is left
+// untouched.
+function _lockRestartModal() {
+  var backdrop = document.getElementById("restart-confirm");
+  if (!backdrop) return;
+  backdrop.classList.add("restart-locked");
+
+  var okBtn = document.getElementById("restart-confirm-ok");
+  var cancelBtn = document.getElementById("restart-confirm-cancel");
+  if (cancelBtn) cancelBtn.disabled = true;
+
+  if (okBtn) {
+    okBtn.disabled = true;
+    okBtn.classList.add("restart-spinner-on");
+
+    // Measure the button *before* touching its content so the replacement
+    // keeps the exact same footprint on screen.
+    var width = okBtn.getBoundingClientRect().width;
+    var height = okBtn.getBoundingClientRect().height;
+    okBtn.textContent = "";
+
+    var spinner = document.createElement("span");
+    spinner.className = "restart-loading";
+    spinner.setAttribute("aria-hidden", "true");
+    okBtn.appendChild(spinner);
+
+    // Pin the measured size so the pill neither expands nor collapses.
+    if (width) okBtn.style.minWidth = width + "px";
+    if (height) okBtn.style.minHeight = height + "px";
+  }
+
+  var closeBtn = document.getElementById("settings-close");
+  if (closeBtn) {
+    closeBtn.disabled = true;
+    closeBtn.classList.add("restart-locked-btn");
+  }
+}
+
+// Tell the Tauri shell to exit now that the backend has quit. Falls back to a
+// no-op when running in a plain browser (no native shell to close).
+function _quitAppNow() {
+  try {
+    var tauri = window.__TAURI__;
+    if (tauri && tauri.core && tauri.core.invoke) {
+      tauri.core.invoke("quit_app");
+    }
+  } catch (_) {
+    // No Tauri runtime (e.g. testing in a browser) — nothing to do.
+  }
+}
+
+async function _persistModelAndQuit(role, filename) {
+  _lockRestartModal();
+  // Stop any in-flight generation first (abort live SSE streams) so the UI
+  // stops streaming before we hand off to the graceful backend shutdown.
+  _abortAllSse();
+
+  var note = document.getElementById("note-" + role);
+  if (note) { note.textContent = "Saving…"; note.className = "settings-model-note"; }
+  try {
+    var resp = await fetch("/api/models/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: role, filename: filename })
+    });
+    if (!resp.ok) {
+      var err = {};
+      try { err = await resp.json(); } catch (_) {}
+      throw new Error(err.detail || "HTTP " + resp.status);
+    }
+    _updateDropdownValue(role, filename);
+    _updateCurrentActive(role, filename);
+    if (note) { note.textContent = "Restarting…"; note.className = "settings-model-note"; }
+    // Model persisted — now shut the backend down so the choice takes effect
+    // on next launch. The response flushes before the process teardown.
+    try {
+      await fetch("/api/models/quit", { method: "POST" });
+    } catch (_) {
+      // The connection may drop as the backend shuts down — that's expected.
+    }
+    // The backend is now gone — close the Tauri window so the app visibly
+    // quits instead of sitting on the locked restart spinner.
+    _quitAppNow();
+  } catch (err) {
+    if (note) { note.textContent = "Error: " + err.message; note.className = "settings-model-note error"; }
+  }
+}
+
+// Shows the restart confirm modal. `role`/`filename` are the pending model
+// choice; `onCancel` fires when the user cancels (so the caller can revert
+// the selection). Clicking OK runs `_persistModelAndQuit` directly and keeps
+// the modal open in its locked, loading state — the caller does not need to
+// act on restart. Mirrors `_confirmDelete`'s modal lifecycle (backdrop,
+// Escape, aria state).
+function _confirmRestart(role, filename, onCancel) {
+    var backdrop = document.getElementById("restart-confirm");
+    var message = document.getElementById("restart-confirm-message");
+    var cancelBtn = document.getElementById("restart-confirm-cancel");
+    var okBtn = document.getElementById("restart-confirm-ok");
+    if (!backdrop || !message || !cancelBtn || !okBtn) { if (onCancel) onCancel(); return; }
+
+    message.innerHTML =
+        '<p class="confirm-copy">Switching model requires an app restart.</p>'
+      + '<p class="confirm-copy">Any chat currently processing data will be stopped.</p>'
+      + '<p class="confirm-subtle">Do you wish to proceed?</p>';
+
+    backdrop.classList.add("active");
+    backdrop.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+    okBtn.focus();
+
+    function locked() { return backdrop.classList.contains("restart-locked"); }
+
+    function dismiss() {
+      backdrop.classList.remove("active");
+      backdrop.setAttribute("aria-hidden", "true");
+      document.body.style.overflow = "";
+      cancelBtn.removeEventListener("click", handleCancel);
+      okBtn.removeEventListener("click", handleRestart);
+      backdrop.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onEscape);
+    }
+
+    function handleCancel() {
+      if (locked()) return;
+      dismiss();
+      if (onCancel) onCancel();
+    }
+    function handleRestart() {
+      if (locked()) return;
+      // Keep the modal visible; _persistModelAndQuit locks it (disables the
+      // buttons, shows the spinner, blocks Escape/backdrop/x) then quits.
+      _persistModelAndQuit(role, filename);
+    }
+    function onBackdrop(e) {
+      if (e.target === backdrop && !locked()) handleCancel();
+    }
+    function onEscape(e) {
+      if (e.key === "Escape" && !locked()) {
+        var modal = document.getElementById("citation-modal");
+        if (modal && modal.classList.contains("active")) return;
+        handleCancel();
+      }
+    }
+
+    cancelBtn.addEventListener("click", handleCancel);
+    okBtn.addEventListener("click", handleRestart);
+    backdrop.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onEscape);
+}
+
+function _updateDropdownValue(role, filename) {
+  var valueEl = document.getElementById("value-" + role);
+  if (valueEl) valueEl.textContent = filename;
+
+  var list = document.getElementById("list-" + role);
+  if (list) {
+    var options = list.querySelectorAll(".settings-dropdown-option[data-filename]");
+    for (var i = 0; i < options.length; i++) {
+      var selected = options[i].dataset.filename === filename;
+      options[i].classList.toggle("selected", selected);
+      options[i].setAttribute("aria-selected", selected ? "true" : "false");
+    }
+    // Selecting an option collapses instantly (no animation).
+    var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
+    _closeDropdownList(list, trigger, true);
+    return;
+  }
+
+  var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+}
+
+// Open/close helpers. Open animates in (80ms). Close animates out by default
+// (80ms) but collapses instantly when an option is clicked. Only one list is
+// open at a time, so opening/leaning on another collapses the previous one
+// animated.
+function _openDropdownList(list, trigger) {
+  if (list._collapseTimeout) {
+    clearTimeout(list._collapseTimeout);
+    list._collapseTimeout = null;
+  }
+  list.classList.remove("no-anim");
+  list.hidden = false;
+  // Force a reflow so the browser starts from the hidden (opacity 0) state
+  // before the .open class transitions it in.
+  void list.offsetHeight;
+  list.classList.add("open");
+  trigger.setAttribute("aria-expanded", "true");
+}
+
+function _closeDropdownList(list, trigger, instant) {
+  if (!list || list.hidden) return;
+
+  if (instant) {
+    list.classList.add("no-anim");
+    list.classList.remove("open");
+    list.hidden = true;
+    list.classList.remove("no-anim");
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+    return;
+  }
+
+  list.classList.remove("open");
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  if (list._collapseTimeout) clearTimeout(list._collapseTimeout);
+  list._collapseTimeout = setTimeout(function () {
+    list.hidden = true;
+    list._collapseTimeout = null;
+  }, 80);
+}
+
+// The options list floats *below* the trigger (fixed-positioned against its
+// rect) so it overlays the card without reflowing it, and scrolls internally
+// once the model list grows long. Only one list is open at a time.
+function _toggleModelDropdown(trigger) {
+  // A disabled trigger (no active model and no candidates) must not open — a
+  // disabled button doesn't normally fire click, but guard anyway so an
+  // assistive-tech or synthetic click can't pop open a pointless empty list.
+  if (trigger.disabled) return;
+  var role = trigger.dataset.role;
+
+  // Refresh the catalog before opening: the models folder is user-editable,
+  // so a file deleted from Finder must disappear from this list immediately.
+  // Re-render only when the data actually changed (otherwise every open would
+  // flicker), then re-resolve the trigger/list since the re-render rebuilt
+  // the DOM.
+  var before = _modelStatusSignature(_cachedModelStatus);
+  _fetchModelStatus().then(function (data) {
+    if (!data || _modelStatusSignature(data) === before) {
+      _openResolvedDropdown(role);
+      return;
+    }
+    _renderSettingsBody(data).then(function () {
+      _openResolvedDropdown(role);
+    });
+  });
+}
+
+function _openResolvedDropdown(role) {
+  var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
+  if (!trigger || trigger.disabled) return;
+  var list = document.getElementById("list-" + role);
+  var isOpen = trigger.getAttribute("aria-expanded") === "true";
+
+  var open = document.querySelectorAll(".settings-dropdown-trigger[aria-expanded='true']");
+  for (var i = 0; i < open.length; i++) {
+    if (open[i] === trigger) continue;
+    var other = document.getElementById("list-" + open[i].dataset.role);
+    _closeDropdownList(other, open[i], false);
+  }
+
+  if (isOpen) {
+    _closeDropdownList(list, trigger, false);
+    return;
+  }
+
+  if (!list) return;
+  var rect = trigger.getBoundingClientRect();
+  list.style.left = rect.left + "px";
+  list.style.width = rect.width + "px";
+  // Anchored flush under the trigger (no gap) so it reads as one joined
+  // control rather than a detached floating panel.
+  list.style.top = rect.bottom + "px";
+  list.style.bottom = "auto";
+  // Cap the height to the room below so it scrolls rather than spilling off
+  // the bottom of the viewport.
+  var spaceBelow = window.innerHeight - rect.bottom - 8;
+  list.style.maxHeight = (spaceBelow < 320 ? Math.max(120, spaceBelow) : 320) + "px";
+
+  _openDropdownList(list, trigger);
+
+  if (!_dropdownDocBound) {
+    _dropdownDocBound = true;
+    document.addEventListener("click", _onDropdownOutsideClick);
+  }
+}
+
+function _onDropdownOutsideClick(e) {
+  var open = document.querySelector(".settings-dropdown-trigger[aria-expanded='true']");
+  if (!open) return;
+  var list = document.getElementById("list-" + open.dataset.role);
+  if (list && !list.contains(e.target) && !open.contains(e.target)) {
+    _closeDropdownList(list, open, false);
+  }
+}
+
+function _collapseAllDropdowns() {
+  var open = document.querySelectorAll(".settings-dropdown-trigger[aria-expanded='true']");
+  for (var i = 0; i < open.length; i++) {
+    var list = document.getElementById("list-" + open[i].dataset.role);
+    _closeDropdownList(list, open[i], true);
+  }
+}
+
+async function _openModelsFolder() {
+  var btn = document.getElementById("open-models-folder");
+  if (btn) btn.disabled = true;
+  try {
+    var resp = await fetch("/api/models/open-folder", { method: "POST" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+  } catch (_) {
+    if (btn) btn.textContent = "Couldn't open folder";
+  }
+  if (btn) btn.disabled = false;
+}
+
+/* -- one-off action toasts -------------------------------------------- */
+// A short-lived, self-dismissing pill for surfacing why an attempted
+// action (e.g. sending with no file attached) was rejected. Shares the
+// bottom-right #toast-stack container with the model-download pills below
+// for one consistent notification spot, but is otherwise a separate,
+// simpler element — no retry button, no progress state, no compact-rail
+// collapsing (it's gone long before a rail resize would matter).
+function _showActionToast(message, isError) {
+  var stack = _toastStackEl();
+  if (!stack) return;
+  var toast = document.createElement("div");
+  toast.className = "action-toast" + (isError ? " error" : "");
+  toast.setAttribute("role", "status");
+  toast.textContent = message;
+  stack.appendChild(toast);
+  void toast.offsetHeight; // force a reflow so the .show transition plays
+  toast.classList.add("show");
+  setTimeout(function () {
+    toast.classList.remove("show");
+    setTimeout(function () {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 200);
+  }, 2500);
+}
+
+/* -- download toast stack -------------------------------------------- */
+// One toast pill per model download, stacked bottom-up.  A download is
+// identified by a unique stream id (not the model key — a single "all" request
+// streams several models through one SSE connection and one toast).
+
+var _downloadToasts = new Map(); // streamId -> {toast, controller, modelKey, hideTimer, ...}
+var _downloadSeq = 0;
+
+function _toastStackEl() {
+  return document.getElementById("toast-stack");
+}
+
+// Mount a fresh pill (cloned from the <template>) into the stack.  Because the
+// stack is a bottom-anchored flex column, the newest toast lands at the bottom
+// and earlier ones ride above it — the usual bottom-right stack behaviour.
+function _makeDownloadToast() {
+  var tpl = document.getElementById("download-toast-template");
+  var stack = _toastStackEl();
+  var node = tpl.content.firstElementChild.cloneNode(true);
+  stack.appendChild(node);
+  return node;
+}
+
+function _ensureToastIcon(toast) {
+  // The static icon (a wrapper holding the download glyph + the hover X)
+  // stays as the toast's leading flex child so both the expanded (icon +
+  // label + %) and collapsed (icon-only) forms work off the same node.
+  // Reorder it to the front if a prior clear left it mid-tree.
+  var icon = toast.querySelector(".download-toast-icon");
+  if (!icon) return;
+  if (toast.firstChild !== icon) toast.insertBefore(icon, toast.firstChild);
+}
+
+function _setDownloadToast(entry, label, pct, isError) {
+  var toast = entry.toast;
+  if (!toast) return;
+  clearTimeout(entry.hideTimer);
+  entry.hideTimer = null;
+  toast.classList.toggle("error", !!isError);
+  _ensureToastIcon(toast);
+
+  // Two-line text block: the *state* is the primary line (always visible),
+  // the model name is a muted secondary line underneath (truncated, never
+  // pushing the state out of view).
+  var textEl = toast.querySelector(".download-toast-text");
+  if (!textEl) {
+    textEl = document.createElement("div");
+    textEl.className = "download-toast-text";
+    toast.appendChild(textEl);
+  }
+
+  var labelEl = textEl.querySelector(".download-toast-label");
+  if (!labelEl || labelEl.textContent !== (label || "")) {
+    var old = textEl.querySelectorAll(".download-toast-label, .download-toast-name");
+    for (var i = 0; i < old.length; i++) old[i].remove();
+    if (label) {
+      labelEl = document.createElement("span");
+      labelEl.className = "download-toast-label";
+      labelEl.textContent = label;
+      textEl.appendChild(labelEl);
+    }
+    if (entry.name) {
+      var nameEl = document.createElement("span");
+      nameEl.className = "download-toast-name";
+      nameEl.textContent = entry.name;
+      textEl.appendChild(nameEl);
+    }
+  }
+
+  var pctEl = toast.querySelector(".download-toast-pct");
+  if (pct !== null && pct !== undefined) {
+    if (!pctEl) {
+      pctEl = document.createElement("span");
+      pctEl.className = "download-toast-pct";
+      toast.appendChild(pctEl);
+    }
+    pctEl.textContent = pct;
+  } else if (pctEl) {
+    pctEl.remove();
+  }
+
+  toast.hidden = false;
+  void toast.offsetHeight; // force a reflow so the add .show transitions in
+  toast.classList.add("show");
+}
+
+function _appendDownloadRetry(entry) {
+  var toast = entry.toast;
+  if (!toast || toast.querySelector(".download-toast-retry")) return;
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "download-toast-retry";
+  btn.textContent = "Retry";
+  btn.addEventListener("click", function () {
+    var key = entry.modelKey;
+    var name = entry.name;
+    _removeDownloadToast(entry);
+    if (key) _startModelDownload(key, name);
+  });
+  toast.appendChild(btn);
+}
+
+function _removeDownloadToast(entry) {
+  var toast = entry.toast;
+  if (!toast || !toast.parentNode) return;
+  clearTimeout(entry.hideTimer);
+  entry.hideTimer = null;
+  toast.classList.remove("show", "cancellable");
+  // Let the fade-out finish, then actually remove the node so the remaining
+  // pills slide down into its place.  Release the download width lock at the
+  // same moment so it can't cause a visible shrink.
+  entry.hideTimer = setTimeout(function () {
+    if (!toast.classList.contains("show") && toast.parentNode) {
+      toast.parentNode.removeChild(toast);
+      toast.style.minWidth = "";
+    }
+  }, 200);
+  _downloadToasts.delete(entry.id);
+}
+
+// Cancel one in-flight model download via its AbortController.  Clicking a
+// pill while its transfer is running is the one interaction a download offers;
+// guard so a stray click on a success/error pill (no active controller or the
+// stream already finished) does nothing.
+function _cancelModelDownload(entry) {
+  if (!entry || !entry.controller) return;
+  entry.toast.classList.remove("cancellable");
+  try {
+    entry.controller.abort();
+  } catch (e) { /* already aborted/closed — treat as cancelled */ }
+  _setDownloadToast(entry, "Download cancelled", null, false);
+  _hideDownloadToastAfter(entry, 2500);
+  _releaseModelRow(entry.lockKey || entry.modelKey);
+}
+
+// Route a click anywhere in the stack to the pill that was clicked (only that
+// download, not the whole stack).  The Retry button receives its own click, so
+// this never double-fires on it.
+_toastStackEl().addEventListener("click", function (event) {
+  var pill = event.target.closest(".download-toast");
+  if (!pill) return;
+  var entry = _downloadToasts.get(pill.dataset.streamId);
+  if (entry) _cancelModelDownload(entry);
+});
+
+// Auto-dismiss a terminal success toast after `ms` (a success is transient;
+// only the error toast stays until the user acts or closes it).
+function _hideDownloadToastAfter(entry, ms) {
+  clearTimeout(entry.hideTimer);
+  entry.hideTimer = setTimeout(function () {
+    _removeDownloadToast(entry);
+  }, ms);
+}
+
+// Lock/release a single model's download row(s) for the duration of its own
+// transfer.  Unlike the old single-download behaviour (which disabled every
+// row), per-model locking keeps other models clickable so a second download can
+// queue its own toast.
+// A row lock key identifies one download target. Each role has a single
+// catalog download, so the key is simply the role name ("llm"/"embedding").
+function _modelDownloadRows(lockKey) {
+  var rows = document.querySelectorAll(
+    '.settings-dropdown-option-download[data-lock-key="' + lockKey + '"]'
+  );
+  return Array.prototype.slice.call(rows);
+}
+
+function _lockModelRow(lockKey) {
+  var rows = _modelDownloadRows(lockKey);
+  for (var i = 0; i < rows.length; i++) rows[i].disabled = true;
+}
+
+function _releaseModelRow(lockKey) {
+  var rows = _modelDownloadRows(lockKey);
+  for (var i = 0; i < rows.length; i++) rows[i].disabled = false;
+}
+
+async function _startModelDownload(modelKey, name) {
+  // Each download gets its own controller, toast, and row lock.  Downloads are
+  // *sequential* on the backend (a shared asyncio.Lock serializes transfers so
+  // two writers never race huggingface_hub's cache), but every request is still
+  // its own SSE stream and its own toast — so starting a second model while one
+  // is running mounts a second pill that waits ("Queued") until it's picked up.
+  var entry = {
+    id: "dl" + (++_downloadSeq),
+    modelKey: modelKey,
+    name: name || null,
+    lockKey: modelKey,
+    controller: new AbortController(),
+    toast: _makeDownloadToast(),
+    hideTimer: null,
+  };
+  entry.toast.dataset.streamId = entry.id;
+  _downloadToasts.set(entry.id, entry);
+
+  // Mark the pill cancellable so the whole pill reads as a cancel button (hover
+  // morphs the glyph to an X; click aborts that download only).
+  entry.toast.classList.add("cancellable");
+  _lockModelRow(entry.lockKey);
+
+  // Hold each pill's width constant for its (usually short) transfer so changing
+  // content never resizes it (especially the shorter cancel label).  A min-width
+  // (not a fixed width) survives the CSS max-width cap that would defeat it.
+  // Measure against the widest content the toast will show — "Downloading model…
+  // 100.00%" — then settle on the real opening label synchronously, so the
+  // browser paints only that (never a flash of the temp content).
+  var stack = _toastStackEl();
+  // Skip the width lock while the stack is compact/icon-only (small window):
+  // in that state pills render as a fixed 40px circle, so measuring their
+  // natural wider width and locking it would fight the .compact CSS.
+  if (!stack.classList.contains("collapsed")
+      && !stack.classList.contains("compact")) {
+    _setDownloadToast(entry, "Downloading model…", "100.00%", false);
+    entry.toast.style.minWidth = entry.toast.offsetWidth + "px";
+  }
+  // The backend serializes downloads via its lock, so until this request is
+  // picked up its SSE stream emits nothing.  Show a short queued state; the
+  // first event ("verifying") replaces it when the transfer starts.
+  _setDownloadToast(entry, "Queued", null, false);
+
+  try {
+    var response = await fetch("/api/models/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelKey }),
+      signal: entry.controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error("Download request failed: " + response.status);
+    }
+
+    await readSseStream(response, function (parsed) {
+      if (parsed.event === "model_download_status") {
+        _handleDownloadProgress(entry, parsed.data);
+      }
+    });
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      _setDownloadToast(entry, "Download failed", null, true);
+      _appendDownloadRetry(entry);
+    }
+  } finally {
+    // No longer cancellable — the transfer ended (complete, failed, or
+    // aborted); drop the hover-morph / cancel affordance.  Drop it from the
+    // live-download map so a re-render won't re-lock its row, but keep the
+    // pill mounted so the terminal toast (success / "Download cancelled" /
+    // retryable error) stays visible until it's removed on hide.  The width
+    // lock stays set until then so it never visibly resizes.
+    entry.toast.classList.remove("cancellable");
+    _releaseModelRow(entry.lockKey);
+    _downloadToasts.delete(entry.id);
+    _refreshAfterDownload();
+  }
+}
+
+function _handleDownloadProgress(entry, data) {
+  // Progress surfaces as that download's pill ("Downloading model… X.XX%"),
+  // never as a bar or in-panel readout. progress is 0..1; clamp so a
+  // downstream overshoot can't exceed 100.
+  var pctRaw = (typeof data.progress === "number" ? data.progress : 0);
+  var pct = Math.max(0, Math.min(100, pctRaw * 100));
+
+  switch (data.status) {
+    case "finalizing":
+      // Network transfer is done but the backend is still reassembling the
+      // file on disk (see download.py) — a real gap of its own, not the same
+      // wait as "Verifying model…" (which is the separate SHA256 pass after
+      // this finishes), so it gets its own label rather than reusing either.
+      _setDownloadToast(entry, "Finalizing download…", null, false);
+      break;
+    case "verifying":
+      _setDownloadToast(entry, "Verifying model…", null, false);
+      break;
+    case "downloading":
+      // Two decimals so the readout reads as a real progress value.
+      _setDownloadToast(entry, "Downloading model…", pct.toFixed(2) + "%", false);
+      break;
+    case "already_exists":
+      _setDownloadToast(entry, "Model already installed", null, false);
+      _hideDownloadToastAfter(entry, 2500);
+      break;
+    case "complete":
+      _setDownloadToast(entry, "Model downloaded", null, false);
+      _hideDownloadToastAfter(entry, 2500);
+      break;
+    case "error":
+      _setDownloadToast(entry, "Download failed", null, true);
+      _appendDownloadRetry(entry);
+      break;
+  }
+}
+
+async function _refreshAfterDownload() {
+  var body = document.getElementById("settings-body");
+  if (body) await _renderSettingsBody();
+  await _checkModelStatus();
+  // Re-rendering the settings body rebuilds the dropdown rows disabled=false,
+  // so re-apply the lock for any model still downloading on another toast.
+  _downloadToasts.forEach(function (entry) {
+    if (entry && entry.lockKey) _lockModelRow(entry.lockKey);
+  });
+}

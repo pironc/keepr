@@ -15,9 +15,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=orange" alt="Issues"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=social" alt="GitHub stars" data-canonical-src="https://img.shields.io/github/stars/pironc/keepr?style=social" style="max-width: 100%;"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/100%25-Local-FF6600" alt="100% Local"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=blue" alt="Issues"></a>
+</p>
+
+<p align="center"><em>Downloads</em></p>
+<p align="center">
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-aarch64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;ARM</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-x86_64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;x86</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-linux-x86_64.AppImage" title="Linux" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="assets/icons/linux.svg" width="15" height="15" style="display:block;" alt="Linux"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-windows-x86_64-setup.exe" title="Windows" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="assets/icons/windows.svg" width="15" height="15" style="display:block;" alt="Windows"></a>
 </p>
 
 # keepr
@@ -42,7 +51,7 @@ Most RAG tools either send your documents to a cloud API (privacy risk) or wrap 
 ### 🔒 Privacy & Air-Gapped Operation
 - **Fully local by default.** `LLM_DRIVER=mock` / `EMBEDDER=mock` (the defaults) run the entire ingestion → retrieval → citation pipeline with zero model downloads — testable in milliseconds.
 - **Real local models** via `llama-cpp-python` (GGUF format) on Metal (Apple Silicon), CUDA, or CPU.
-- **Air-gapped by design.** The frontend is hand-written vanilla HTML/CSS/JS with zero external dependencies — no CDN script tag, no npm build step. Fonts are vendored locally as `.woff2` files; icons are hand-authored inline SVGs.
+- **Air-gapped by design.** The frontend is hand-written vanilla HTML/CSS/JS with zero external dependencies — no CDN script tag, no npm build step. Fonts are vendored locally as `.woff2` files; icons are hand-authored / vendored locally as `.svg` files (no icon CDN).
 - **Proven air-gapped.** The entire test suite runs with `pytest-socket` blocking all real network access, including a positive-control test proving the block is actually active.
 
 ### 📄 Chat-Grounded RAG with Deterministic Anti-Hallucination
@@ -60,11 +69,17 @@ Most RAG tools either send your documents to a cloud API (privacy risk) or wrap 
 - A file is staged on drop and processed the moment you hit send: **extract → chunk → embed → index**.
 - A per-file status animation (`staged → extracting → chunking → embedding → indexed`) is driven by real backend SSE events, not a fake timer.
 - Every file type goes through the same pipeline — the `Ingestor` protocol is what makes audio/video support growable later without touching anything downstream.
+- Runs as its own background task (`IngestionWorker`), independent of your HTTP connection — closing the tab or losing network mid-upload doesn't pause or lose the in-progress extract→chunk→embed→index work; reopening the conversation reattaches to it live.
 
 ### 🔄 Durable, Connection-Independent Generation
-- The moment you hit send, message generation runs as a **background task** independent of your HTTP connection.
+- The moment you hit send, message generation runs as a **background task** (`GenerationWorker`) independent of your HTTP connection, on its own queue separate from ingestion's — an embedding only ever waits for a prior embedding, never for an unrelated LLM generation.
 - Refresh the page mid-answer — the answer keeps generating and lands in the database regardless. Reloading reattaches to it live, wherever it's gotten to.
-- Crash recovery: on startup, any message stuck mid-generation from a previous process death is marked as errored with its partial content preserved, rather than left spinning forever.
+- Crash recovery: on startup, any message or document stuck mid-processing from a previous process death is marked as errored with its partial content preserved, rather than left spinning forever.
+
+### ⚙️ In-App Model Management
+- The Settings menu lists every `.gguf` in `models/`, classified as an LLM or embedding model from its own metadata (a pooling-layer key), never by filename — no hardcoded model-name list to keep in sync as new architectures show up.
+- Download a model straight from Settings (Hugging Face Hub, with live progress) instead of running a separate CLI step first.
+- Switching the active LLM or embedding model persists the choice and restarts the app so the new model actually loads; deleting a model file is available the same way.
 
 ### 🧱 Pluggable Architecture
 Every layer is behind a protocol/ABC — swap implementations without restructuring:
@@ -93,6 +108,7 @@ Every choice in this stack was made for a specific, documented reason — not co
 | **Language** | Python 3.12+ | Fast enough for a single-user app; the ML ecosystem (numpy, llama-cpp-python) is Python-native. |
 | **API framework** | FastAPI + uvicorn | Async-native, SSE streaming built in, strong type system via Pydantic v2. |
 | **LLM inference** | `llama-cpp-python` (GGUF) | Ollama is faster to a demo but opaque internally. `llama-cpp-python` gives real GGUF/K-quant/mmap internals from one codebase across Metal, CUDA, and CPU — you can read exactly how inference works. |
+| **Cross-turn KV cache** | Deliberately not enabled | llama.cpp's `cache_prompt` only pays off via prefix reuse, and RAG gives this prompt no reusable prefix: the system message is rebuilt every turn carrying the freshly-retrieved `<context>` chunks, so the first differing token lands early and almost nothing is reused. The costly input — the retrieved context block — is recomputed every answer regardless, and holding a shared cache would keep KV resident in RAM between calls. If multi-turn latency ever matters, the higher-leverage fix is trimming old history / adaptive retrieval size (real token savings), not KV caching. Rationale also in `ARCHITECTURE.md` and `src/rag/prompts.py`. |
 | **LLM model** | Qwen3-8B, Q6_K (~6.7 GB) | Swapped from Llama 3.1 8B for multilingual support — Qwen leads Chinese-language benchmarks by a wide margin and multilingual MMLU (~80 vs. ~72). Q6_K rather than a leaner quant because the memory budget has room. Newer MoE variants (Qwen3.5/3.6) were deliberately not chosen: on unified-memory machines (Apple Silicon), inactive MoE experts still occupy real RAM — an 8B dense model is the better fit for this hardware. |
 | **Embedding model** | `nomic-embed-text-v2-moe` (GGUF, Q8_0) | Multilingual (~100 languages, 8-expert MoE), 768 dimensions. Same GGUF path, same `search_document:`/`search_query:` prefix convention as v1.5 — a drop-in swap from the English-only v1.5. |
 | **Vector store** | Hand-rolled `NumpyFlatIndex` (float32, exact) | At a personal-scale corpus (thousands of chunks), brute-force cosine similarity is *not* a shortcut — it's the technically correct choice: exact (no ANN recall loss), sub-millisecond, and every line of the math is explainable. |
@@ -203,7 +219,7 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
     citations: list[Citation]
-    status: MessageStatus  # queued → retrieving → generating → done | error
+    status: MessageStatus  # queued → processing-documents → retrieving → generating → done | error
     created_at: datetime
 ```
 
@@ -230,8 +246,8 @@ Open [http://localhost:8000](http://localhost:8000). Drop a PDF or `.txt` file i
 For real local inference, mount your models and switch the drivers:
 
 ```bash
-# First, download GGUF models to data/models/ (one-time):
-make download-models
+# First, download GGUF models to models/ (one-time):
+python scripts/download_models.py
 
 # Then override the Compose environment:
 LLM_DRIVER=llama_cpp EMBEDDER=llama_cpp docker compose up --build
@@ -247,8 +263,8 @@ Run natively with hot reload — no Docker needed:
 git clone https://github.com/pironc/keepr.git
 cd keepr
 
-python3 -m venv .venv && source .venv/bin/activate
 make install
+source .venv/bin/activate
 make run
 ```
 
@@ -261,15 +277,16 @@ Copy `.env.example` to `.env` to customize. The essentials:
 | Variable | Purpose |
 |---|---|
 | `LLM_DRIVER` | `mock` (default, zero-download) or `llama_cpp` (real local GGUF inference). |
-| `LLM_MODEL_PATH` | Path to GGUF file. Only when `LLM_DRIVER=llama_cpp`. |
+| `LLM_MODEL_PATH` | Path to GGUF file. Only when `LLM_DRIVER=llama_cpp`. Leave unset to use the model picked in the Settings menu. |
 | `LLM_CONTEXT_WINDOW` | Context window size (default auto-detected from `MEMORY_TIER`, typically `8192`). |
 | `LLM_GPU_LAYERS` | Layers to offload to GPU (`-1` = all, default). |
 | `EMBEDDER` | `mock` (default) or `llama_cpp`. |
-| `EMBEDDING_MODEL_PATH` | Path to GGUF embedding model. Only when `EMBEDDER=llama_cpp`. |
+| `EMBEDDING_MODEL_PATH` | Path to GGUF embedding model. Only when `EMBEDDER=llama_cpp`. Leave unset to use the model picked in the Settings menu. |
 | `EMBEDDING_GPU_LAYERS` | Embedding GPU layers (default `0` — embedding runs on CPU to avoid GPU contention with the LLM). |
 | `VECTOR_INDEX_BACKEND` | `flat` (float32, exact) or `quantized` (int8 scalar quant, ~4× less memory). |
 | `RETRIEVAL_TOP_K` | Number of chunks to retrieve per query (default `5`). |
 | `RETRIEVAL_MIN_SIMILARITY` | Cosine similarity threshold below which the engine refuses to answer (default `0.22` — calibrated against nomic-embed-text-v2-moe). |
+| `MODELS_DIR` | Directory scanned for `.gguf` model files (default `models`). |
 | `DATABASE_PATH` | SQLite database path (default `data/keepr.db`). |
 | `INDEX_DIR` | Per-conversation vector index directory (default `data/index`). |
 | `UPLOAD_DIR` | Uploaded file storage (default `data/uploads`). |
@@ -280,8 +297,16 @@ Copy `.env.example` to `.env` to customize. The essentials:
 
 ### Running with Real Local Models
 
+Install the `llama_cpp` driver — a separate, heavier extra (compiles `llama-cpp-python` from source; on Apple Silicon this picks up Metal acceleration automatically, no extra flags needed):
+
 ```bash
-make download-models   # fetches Qwen3-8B + nomic-embed-text-v2-moe GGUF pair (~7.5 GB total)
+pip install -e ".[llama]"
+```
+
+Then fetch the default Qwen3-8B + nomic-embed-text-v2-moe GGUF pair (~7.5 GB total) either from the app's **Settings** menu, or from the CLI:
+
+```bash
+python scripts/download_models.py
 ```
 
 Then in `.env`:
@@ -292,6 +317,8 @@ EMBEDDER=llama_cpp
 ```
 
 Restart `make run`. The first message will be slower (model load into memory); everything after that runs from the resident warm stack.
+
+To use a different model, drop any llama.cpp-compatible GGUF into `models/` and pick it in the **Settings** menu — the choice is saved and applied on the next restart. You can also set `LLM_MODEL_PATH` / `EMBEDDING_MODEL_PATH` directly to override it. (The embedding model is less freely swappable: `RETRIEVAL_MIN_SIMILARITY` is calibrated to nomic-embed-text-v2-moe, so changing it means recalibrating that threshold.)
 
 ### Native Desktop App (macOS)
 
@@ -320,11 +347,15 @@ keepr/
 │   ├── config.py              # Hardware detection, memory tiers, Settings
 │   ├── concurrency.py         # LockedEmbedder / LockedLLMDriver wrappers
 │   ├── logger.py              # Structured logging
+│   ├── download.py            # Model-download helpers (Hugging Face Hub, shared with the CLI)
+│   ├── gguf_meta.py           # Lightweight GGUF metadata classifier (pooling-type detection)
+│   ├── model_unavailable.py   # ModelUnavailableError — missing/broken GGUF file, by role
 │   ├── api/
 │   │   ├── app.py             # FastAPI app factory + lifespan
 │   │   ├── context.py         # AppContext + DI
 │   │   ├── routes_conversations.py
 │   │   ├── routes_messages.py # Multiplexed SSE endpoint
+│   │   ├── routes_models.py   # Model status / select / download / quit endpoints
 │   │   └── sse.py             # SSE formatting helpers
 │   ├── db/
 │   │   ├── pool.py            # SQLiteConnectionPool
@@ -338,6 +369,7 @@ keepr/
 │   ├── ingestion/
 │   │   ├── base.py            # Ingestor protocol
 │   │   ├── pipeline.py        # Orchestrates extract→chunk→embed→index
+│   │   ├── worker.py          # Background task — durable, connection-independent
 │   │   ├── chunker.py         # Text chunking with overlap
 │   │   ├── registry.py        # Finds the right ingestor for a file
 │   │   ├── pdf_ingestor.py
@@ -373,9 +405,11 @@ keepr/
 │   ├── src/lib.rs
 │   └── binaries/              # PyInstaller-compiled backend binary
 ├── tests/                     # pytest + pytest-asyncio + pytest-socket
+├── models/                    # Downloaded .gguf model weights (MODELS_DIR)
 ├── scripts/
-│   └── download_models.py     # One-time GGUF model fetcher (the only network-touching script)
+│   └── download_models.py     # One-time GGUF model fetcher (test-exempt network script)
 ├── assets/                    # Logo, screenshots
+│   └── icons/                 # White brand icons for the download buttons
 ├── ARCHITECTURE.md            # Full technical design & scaling story
 ├── CLAUDE.md                  # AI assistant / contributor guidance
 ├── Makefile
@@ -389,13 +423,14 @@ keepr/
 ```bash
 make install          # pip install -e ".[dev]"
 make run              # uvicorn src.api.app:app --reload --port 8000
-make download-models  # fetch GGUF models (the only network-touching step)
 make test             # pytest
 make lint             # ruff check .
 make typecheck        # mypy --strict
 make ci               # lint + typecheck + test — run before considering anything done
 make clean            # wipes DB/index/uploads (app state) — NOT model weights
-make clean-models     # wipes data/models/ too
+make clean-models     # wipes models/ too
+make wipe             # full reset to a just-cloned state (venv, caches, build
+                       # output, src-tauri/target, etc.) — models/ still exempt
 ```
 
 ### Testing
@@ -409,6 +444,7 @@ The test suite runs with network access disabled globally (`pytest-socket`) — 
 Key test files:
 - `tests/test_rag_engine.py` — threshold-based refusal, citation verification (including a driver that deliberately fabricates a citation)
 - `tests/test_generation_worker.py` — connection-independent generation, crash recovery, watcher reattachment
+- `tests/test_ingestion_worker.py` — connection-independent ingestion, crash recovery, idle-unload timing
 - `tests/test_ingestion_pipeline.py` — content-hash dedup, status transitions
 - `tests/test_vectorstore.py` — quantization memory ratio & top-1 agreement benchmarks
 - `tests/test_airgapped.py` — positive control proving the socket block is live
@@ -453,7 +489,6 @@ Being explicit about scope:
 - **Real audio/video transcription.** `AudioVideoIngestor.extract()` raises `UnsupportedSourceError` today. The plan: `faster-whisper`, lazy-loaded, memory-purged after use.
 - **Conversation history truncation/summarization.** Long conversations currently send full history to the model every turn.
 - **BM25/keyword search fused with vector search** (Reciprocal Rank Fusion) — cheap to add, catches exact-term queries embeddings miss.
-- **File ingestion disconnect-resilience.** Ingestion runs inline in the request; a refresh mid-upload leaves a document stuck mid-status (though already-persisted chunks survive). The identical pattern `GenerationWorker` used for messages would generalize directly.
 - **A labeled grounding eval set** (30-50 questions across answerable/unanswerable/adversarial categories, CI-enforced) — the mechanism is tested; a broader statistical harness is the natural next step.
 
 ---

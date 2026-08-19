@@ -10,6 +10,7 @@ one-line addition, not a rewrite.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -45,43 +46,14 @@ def detect_backend() -> Backend:
 class MemoryTier:
     name: str
     min_ram_gb: float
-    recommended_model: str
     context_window: int
-    description: str
 
 
 MEMORY_TIERS: tuple[MemoryTier, ...] = (
-    MemoryTier(
-        name="minimal",
-        min_ram_gb=8.0,
-        recommended_model="Qwen3 4B Instruct, Q4_K_M (~2.5GB)",
-        context_window=4096,
-        description="Tight budget: small model, short context.",
-    ),
-    MemoryTier(
-        name="standard",
-        min_ram_gb=16.0,
-        recommended_model="Qwen3 8B, Q6_K (~6.7GB)",
-        context_window=8192,
-        description="The default target for this project (e.g. a 24GB MacBook Air).",
-    ),
-    MemoryTier(
-        name="large",
-        min_ram_gb=32.0,
-        recommended_model="Qwen3 8B, Q8_0 (~8.7GB), or Qwen3 14B",
-        context_window=16384,
-        description="A dedicated workstation with headroom: higher quant or a bigger model, longer context.",
-    ),
-    MemoryTier(
-        name="server",
-        min_ram_gb=64.0,
-        recommended_model="A 70B-class model (quantized), or multiple concurrent model instances",
-        context_window=32768,
-        description=(
-            "A dedicated server/GPU box — the explicit scale-up path for this project: "
-            "same LLMDriver interface, a bigger model behind it."
-        ),
-    ),
+    MemoryTier(name="minimal", min_ram_gb=8.0, context_window=4096),
+    MemoryTier(name="standard", min_ram_gb=16.0, context_window=8192),
+    MemoryTier(name="large", min_ram_gb=32.0, context_window=16384),
+    MemoryTier(name="server", min_ram_gb=64.0, context_window=32768),
 )
 
 
@@ -90,10 +62,63 @@ def select_memory_tier(available_ram_gb: float) -> MemoryTier:
     return max(eligible, key=lambda tier: tier.min_ram_gb) if eligible else MEMORY_TIERS[0]
 
 
+# Model weights live in a root `models/` directory, deliberately separate from
+# `data/` (private runtime state). The defaults below are *filenames* resolved
+# against that directory; a user can point LLM_MODEL_PATH / EMBEDDING_MODEL_PATH
+# at any llama.cpp-compatible GGUF, or pick one in the settings menu, which
+# persists the choice to MODEL_SELECTION_PATH and applies it on the next start.
+DEFAULT_MODELS_DIR = Path("models")
+DEFAULT_LLM_MODEL = "Qwen_Qwen3-8B-Q6_K.gguf"
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text-v2-moe.Q8_0.gguf"
+DEFAULT_MODEL_SELECTION_PATH = Path("data/model_selection.json")
+
+
+def load_model_selection(path: Path) -> dict[str, str]:
+    """Read a persisted model selection (filenames keyed by role: llm/embedding).
+
+    Written by `POST /api/models/select` and read here at startup so a choice
+    survives a restart. A missing or malformed file is treated as "no
+    selection", never a crash — the defaults still apply.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+    }
+
+
+def save_model_selection(path: Path, selection: dict[str, str]) -> None:
+    """Persist a model selection (atomic-enough for a single-user app)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _resolve_model_path(
+    env_value: str | None, selected: str | None, default_filename: str, models_dir: Path
+) -> Path:
+    """Precedence: explicit env var > settings-menu selection > default filename."""
+    if env_value and env_value.strip():
+        return Path(env_value.strip())
+    if selected:
+        return models_dir / selected
+    return models_dir / default_filename
+
+
 @dataclass(slots=True)
 class Settings:
     backend: Backend
     memory_tier: MemoryTier
+
+    models_dir: Path
+    model_selection_path: Path
 
     llm_driver: str
     llm_model_path: Path
@@ -128,18 +153,29 @@ class Settings:
         else:
             tier = select_memory_tier(psutil.virtual_memory().total / (1024**3))
 
+        models_dir = Path(os.environ.get("MODELS_DIR", str(DEFAULT_MODELS_DIR)))
+        selection_path = Path(
+            os.environ.get("MODEL_SELECTION_PATH", str(DEFAULT_MODEL_SELECTION_PATH))
+        )
+        selection = load_model_selection(selection_path)
+
         return cls(
             backend=backend,
             memory_tier=tier,
+            models_dir=models_dir,
+            model_selection_path=selection_path,
             llm_driver=os.environ.get("LLM_DRIVER", "mock"),
-            llm_model_path=Path(
-                os.environ.get("LLM_MODEL_PATH", "data/models/Qwen_Qwen3-8B-Q6_K.gguf")
+            llm_model_path=_resolve_model_path(
+                os.environ.get("LLM_MODEL_PATH"), selection.get("llm"), DEFAULT_LLM_MODEL, models_dir
             ),
             llm_context_window=int(os.environ.get("LLM_CONTEXT_WINDOW", str(tier.context_window))),
             llm_gpu_layers=int(os.environ.get("LLM_GPU_LAYERS", "-1")),
             embedder=os.environ.get("EMBEDDER", "mock"),
-            embedding_model_path=Path(
-                os.environ.get("EMBEDDING_MODEL_PATH", "data/models/nomic-embed-text-v2-moe.Q8_0.gguf")
+            embedding_model_path=_resolve_model_path(
+                os.environ.get("EMBEDDING_MODEL_PATH"),
+                selection.get("embedding"),
+                DEFAULT_EMBEDDING_MODEL,
+                models_dir,
             ),
             embedding_gpu_layers=int(os.environ.get("EMBEDDING_GPU_LAYERS", "0")),
             vector_index_backend=os.environ.get("VECTOR_INDEX_BACKEND", "flat"),

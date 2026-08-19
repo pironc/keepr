@@ -9,16 +9,21 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+import pytest
+
 from src.db.repository import Repository
 from src.embeddings.mock_embedder import MockEmbedder
 from src.llm.base import LLMDriver
 from src.llm.mock_driver import MockLLMDriver
+from src.model_unavailable import ModelUnavailableError
 from src.models import (
     Chunk,
     Conversation,
     Document,
     DocumentStatus,
     LLMMessage,
+    Message,
+    MessageStatus,
     PageRef,
     SourceKind,
 )
@@ -33,6 +38,35 @@ class _FabricatingDriver(LLMDriver):
 
     async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
         yield "According to the manual [chunk_1] and also [chunk_99], which was never retrieved."
+
+
+class _BareCitationDriver(LLMDriver):
+    """A driver that writes bare [N] citations directly instead of the
+    required [chunk_N] format — deviating exactly the way a real model
+    sometimes does — split across several yields (mid-marker, in one case)
+    to exercise _stream_strip_citation_tags' cross-chunk buffering the same
+    way a real token-by-token stream would, not just a tag that happens to
+    arrive whole in a single token."""
+
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        for piece in ["The manual says this ", "[", "1", "]", " and also this", " [2] here."]:
+            yield piece
+
+
+class _EmbedderQueryFailure:
+    """An embedder whose query embedding raises ModelUnavailableError (the
+    duck-typed shape the RagEngine consumes via the Embedder protocol)."""
+
+    dimensions = 4
+
+    async def embed_documents(self, texts):  # type: ignore[no-untyped-def]
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    async def embed_query(self, text):  # type: ignore[no-untyped-def]
+        raise ModelUnavailableError("Embedding model file not found: models/nomic.gguf")
+
+    async def availability(self):  # type: ignore[no-untyped-def]
+        return "Embedding model file not found: models/nomic.gguf"
 
 
 async def _seed_chunk(repository: Repository, conversation_id: str, text: str) -> Chunk:
@@ -254,6 +288,47 @@ async def test_citation_tags_are_stripped_from_display_text(
     assert {citation.document_id for citation in done.message.citations} == {document.id}
 
 
+async def test_bare_citation_markers_are_stripped_from_the_live_stream(
+    repository: Repository, embedder: MockEmbedder
+) -> None:
+    """A model that ignores the [chunk_N] instruction and writes a bare [N]
+    directly must never have it appear in a streamed TokenEvent either —
+    otherwise a reader watches "[1]" flash by as plain text while the
+    answer is generating, then disappear the moment the final
+    _strip_citation_tags pass reruns on the complete text and removes what
+    it never should have shown live in the first place.
+    _stream_strip_citation_tags must strip the bare-[N] case
+    (_BARE_NUMBER_PATTERN) too, not just [chunk_N]. _BareCitationDriver
+    splits a marker across multiple yields specifically so this also
+    proves the cross-chunk buffering, not just the same-chunk case."""
+    conversation_id = "conv-bare-citation"
+    chunk = await _seed_chunk(repository, conversation_id, "Some retrievable manual text.")
+    index = NumpyFlatIndex()
+    index.add([chunk.id], await embedder.embed_documents([chunk.text]))
+
+    engine = RagEngine(repository=repository, embedder=embedder, top_k=1, min_similarity=0.0)
+
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "manual text", [], index, _BareCitationDriver()
+        )
+    ]
+
+    streamed_text = "".join(event.text for event in events if isinstance(event, TokenEvent))
+    assert "[1]" not in streamed_text
+    assert "[2]" not in streamed_text
+    # The words around the stripped markers still made it through untouched.
+    assert "manual says this" in streamed_text
+    assert "also this" in streamed_text
+    assert "here" in streamed_text
+
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert "[1]" not in done.message.content
+    assert "[2]" not in done.message.content
+
+
 async def test_citation_verification_drops_ids_that_were_never_retrieved(
     repository: Repository, embedder: MockEmbedder
 ) -> None:
@@ -363,3 +438,281 @@ async def test_greeting_bypasses_embedding_and_llm(
     # Must be a real answer, not the canned greeting.
     assert done.message.content != _GREETING_RESPONSE
     assert len(done.message.citations) > 0
+
+
+class _DoneDriver(LLMDriver):
+    """A driver that would generate if reached — proves the query-embed failure
+    short-circuits before inference."""
+
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        yield "I should never be reached."
+
+
+async def test_missing_embedder_query_failure_is_a_clean_error_not_a_crash(
+    repository: Repository,
+) -> None:
+    """When the embedding model is missing, query embedding raises
+    ModelUnavailableError. With a message_id (GenerationWorker path) the engine
+    must finalize an ERROR message and yield a DoneEvent rather than crash —
+    so a text-only question never produces a generic 'Something went wrong'."""
+    await repository.create_conversation(Conversation(id="conv-qfail", title="test"))
+
+    engine = RagEngine(repository=repository, embedder=_EmbedderQueryFailure(), top_k=5, min_similarity=0.0)
+    index = NumpyFlatIndex()
+    driver = _DoneDriver()
+    # Mirrors how GenerationWorker drives the engine: a QUEUED assistant
+    # placeholder row exists before answer() is called, and finalize_message()
+    # UPDATEs that placeholder on the error path.
+    message_id = "msg-qfail"
+    await repository.create_message(
+        Message(
+            id=message_id,
+            conversation_id="conv-qfail",
+            role="assistant",
+            content="",
+            status=MessageStatus.QUEUED,
+        )
+    )
+
+    events = [
+        event
+        async for event in engine.answer(
+            "conv-qfail", "what's the drone range?", [], index, driver, message_id=message_id
+        )
+    ]
+
+    # The final event is a DoneEvent, proof the engine returned rather than
+    # raising; its message is marked ERROR and carries the actionable text.
+    assert isinstance(events[-1], DoneEvent)
+    assert events[-1].message.status == MessageStatus.ERROR
+    assert events[-1].message.error_message is not None
+    assert "Embedding model file not found" in events[-1].message.error_message
+
+    # The persisted placeholder reflects the ERROR.
+    placeholder = await repository.get_message(message_id)
+    assert placeholder is not None
+    assert placeholder.status == MessageStatus.ERROR
+    assert placeholder.error_message is not None
+    assert "Embedding model file not found" in placeholder.error_message
+
+    # Without a message_id (direct-call tests), today's behavior — propagate.
+    with pytest.raises(ModelUnavailableError):
+        events = [
+            event
+            async for event in engine.answer(
+                "conv-qfail", "what's the drone range?", [], index, driver
+            )
+        ]
+
+
+class _EmbedderOnlyMissingDriver(LLMDriver):
+    """An LLM driver that IS available (retrieval failed before it was ever
+    called) — proves the "only embedding model missing" message fires when the
+    language model companion is fine."""
+
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        yield "I should never be reached."
+
+
+class _BothMissingDriver(LLMDriver):
+    """An LLM driver whose sibling-availability probe reports a missing language
+    model file — proves the "both models unavailable" message fires when the
+    user has neither model installed, and that it does so WITHOUT ever reaching
+    generation (the engine short-circuits on both-missing)."""
+
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        self.generate_calls += 1
+        yield "I should never be reached."
+
+    async def availability(self) -> str | None:
+        return "Language model file not found: models/qwen.gguf"
+
+
+class _LanguageModelMissingDriver(LLMDriver):
+    """An LLM driver that raises ModelUnavailableError at generate time — the
+    language model file exists-and-was-selected but fails to load, and
+    retrieval (which uses the embedder) already succeeded.  The unreachable
+    ``yield`` keeps this an async-generator function (matching real drivers)
+    so ``async for`` in the engine sees the exception on first iteration."""
+
+    async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
+        def _raise() -> None:
+            raise ModelUnavailableError(
+                "Language model could not be loaded — the file may be corrupted "
+                "or the wrong architecture for this build of keepr: models/qwen.gguf."
+            )
+
+        _raise()
+        yield "unreachable"  # keeps this an async generator; never produced
+
+
+async def _placeholder_message(
+    repository: Repository, conversation_id: str, message_id: str
+) -> None:
+    """Insert the QUEUED assistant placeholder GenerationWorker would have
+    created, so the engine's ERROR path finalizes (UPDATEs) it."""
+    await repository.create_message(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="",
+            status=MessageStatus.QUEUED,
+        )
+    )
+
+
+async def test_embedder_and_llm_both_missing_message_acknowledges_both(
+    repository: Repository,
+) -> None:
+    """With neither an embedding nor a language model, the error names BOTH,
+    not just the embedder that happens to fail first."""
+    conversation_id = "conv-both"
+    await repository.create_conversation(Conversation(id=conversation_id, title="test"))
+    engine = RagEngine(
+        repository=repository, embedder=_EmbedderQueryFailure(), top_k=5, min_similarity=0.0
+    )
+    message_id = "msg-both"
+    await _placeholder_message(repository, conversation_id, message_id)
+    driver = _BothMissingDriver()
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "what's the drone range?", [], NumpyFlatIndex(),
+            driver, message_id=message_id,
+        )
+    ]
+
+    # The short-circuit must fire BEFORE retrieval/generation: the driver's
+    # generate() is never reached, so the reply is instant (no thinking).
+    assert driver.generate_calls == 0
+
+    assert isinstance(events[-1], DoneEvent)
+    assert events[-1].message.status == MessageStatus.ERROR
+    text = events[-1].message.content
+    # Concise: just names that neither model is downloaded.
+    assert "embedding model" in text and "language model" in text
+    assert "is downloaded" in text
+
+
+async def test_both_missing_direct_call_short_circuits_without_raising(
+    repository: Repository,
+) -> None:
+    """Even on the direct-call path (message_id None), a both-missing state
+    now returns the canned reply instead of attempting retrieval and raising.
+    This is the instant check: the driver is never asked to generate, so there
+    is no 'thinking' before the answer appears."""
+    conversation_id = "conv-both-direct"
+    await repository.create_conversation(Conversation(id=conversation_id, title="test"))
+    engine = RagEngine(
+        repository=repository, embedder=_EmbedderQueryFailure(), top_k=5, min_similarity=0.0
+    )
+    driver = _BothMissingDriver()
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "what's the drone range?", [], NumpyFlatIndex(), driver
+        )
+    ]
+
+    assert driver.generate_calls == 0
+    assert isinstance(events[-1], DoneEvent)
+    # On the direct-call path the canned reply is returned as a normal message
+    # (direct-call _finalize creates a fresh DONE message — the ERROR status we
+    # set only lands on the GenerationWorker placeholder via message_id).  The
+    # point here is content + no generate() call, so the reply is instant.
+    assert "neither an embedding model nor a language model is downloaded" in events[-1].message.content
+
+
+async def test_greeting_does_not_bypass_missing_model_check(
+    repository: Repository,
+) -> None:
+    """A bare greeting with no models installed must surface the "no model"
+    error, not the canned greeting — the availability check runs first, so
+    "hi" can't masquerade as a healthy session when nothing is downloaded."""
+    conversation_id = "conv-greet-nomodel"
+    await repository.create_conversation(Conversation(id=conversation_id, title="test"))
+    engine = RagEngine(
+        repository=repository, embedder=_EmbedderQueryFailure(), top_k=5, min_similarity=0.0
+    )
+    driver = _BothMissingDriver()
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "Hello!", [], NumpyFlatIndex(), driver
+        )
+    ]
+
+    assert driver.generate_calls == 0
+    assert isinstance(events[-1], DoneEvent)
+    # The both-missing reply, not the greeting canned text.
+    assert events[-1].message.content != _GREETING_RESPONSE
+    assert "neither an embedding model nor a language model is downloaded" in events[-1].message.content
+
+
+async def test_only_embedding_model_missing_message_is_scoped(
+    repository: Repository,
+) -> None:
+    """When the LLM is fine, the error is scoped to the embedding model only —
+    it must not claim the language model is unavailable."""
+    conversation_id = "conv-embonly"
+    await repository.create_conversation(Conversation(id=conversation_id, title="test"))
+    engine = RagEngine(
+        repository=repository, embedder=_EmbedderQueryFailure(), top_k=5, min_similarity=0.0
+    )
+    message_id = "msg-embonly"
+    await _placeholder_message(repository, conversation_id, message_id)
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "what's the drone range?", [], NumpyFlatIndex(),
+            _EmbedderOnlyMissingDriver(), message_id=message_id,
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    assert events[-1].message.status == MessageStatus.ERROR
+    text = events[-1].message.content
+    assert "embedding model" in text
+    assert "no embedding model is installed" in text
+    assert "language model" not in text  # the LLM is fine — don't blame it
+    # The per-file reason is preserved for diagnostics, not in the chat text.
+    assert "Embedding model file not found" in (events[-1].message.error_message or "")
+
+
+async def test_only_language_model_missing_message_is_scoped(
+    repository: Repository, embedder: MockEmbedder
+) -> None:
+    """Retrieval succeeds but the language model fails to load: the error is
+    scoped to the language model and surfaces the load/corruption reason."""
+    conversation_id = "conv-llmonly"
+    chunk = await _seed_chunk(
+        repository,
+        conversation_id,
+        "The drone's max flight time is 28 minutes on a full battery.",
+    )
+    index = NumpyFlatIndex()
+    index.add([chunk.id], await embedder.embed_documents([chunk.text]))
+
+    engine = RagEngine(repository=repository, embedder=embedder, top_k=5, min_similarity=0.0)
+    driver = _LanguageModelMissingDriver()
+    message_id = "msg-llmonly"
+    await _placeholder_message(repository, conversation_id, message_id)
+    events = [
+        event
+        async for event in engine.answer(
+            conversation_id, "drone flight time", [], index, driver, message_id=message_id
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    assert events[-1].message.status == MessageStatus.ERROR
+    text = events[-1].message.content
+    assert "language model" in text
+    assert "no language model is installed" in text
+    assert "embedding model" not in text  # retrieval worked — don't blame the embedder
+    # The load/corruption reason is preserved for diagnostics, not in the chat text.
+    assert "could not be loaded" in (events[-1].message.error_message or "")

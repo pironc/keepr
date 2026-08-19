@@ -7,6 +7,15 @@ threshold in `rag/engine.py`, which refuses before the LLM is even called.
 This prompt handles the softer case: retrieval cleared that bar, but the
 retrieved chunks still might not fully answer the question, and a
 well-behaved model should say so rather than filling the gap.
+
+Why no cross-turn KV cache: the freshly-retrieved `<context>` block is
+embedded in this *system* message, which is rebuilt on every call. That
+means the prompt has no reusable prefix across turns — llama.cpp's
+`cache_prompt` only helps via byte-identical prefix reuse, and the first
+diverging token (the context) lands near the start, so a cached prefix
+would be a thin sliver. The token-heavy context is anyway recomputed every
+answer. If multi-turn latency ever matters, trim old history / shrink
+retrieval instead — those cut actual input tokens.
 """
 
 from __future__ import annotations

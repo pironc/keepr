@@ -15,9 +15,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=orange" alt="Issues"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/stars/pironc/keepr?style=social" alt="GitHub stars" data-canonical-src="https://img.shields.io/github/stars/pironc/keepr?style=social" style="max-width: 100%;"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/badge/100%25-Local-FF6600" alt="100% Local"></a>
+  <a href="https://github.com/pironc/keepr"><img src="https://img.shields.io/github/issues/pironc/keepr?style=flat-square&color=blue" alt="Issues"></a>
+</p>
+
+<p align="center"><em>Downloads</em></p>
+<p align="center">
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-aarch64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;ARM</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-x86_64.dmg" style="display:inline-block; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;">&#63743;&#160;OSX&#160;x86</a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-linux-x86_64.AppImage" title="Linux" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/linux.svg" width="15" height="15" style="display:block;" alt="Linux"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-windows-x86_64-setup.exe" title="Windows" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/windows.svg" width="15" height="15" style="display:block;" alt="Windows"></a>
 </p>
 
 # keepr
@@ -42,7 +51,7 @@
 ### 🔒 隐私与离线运行
 - **默认完全本地。** `LLM_DRIVER=mock` / `EMBEDDER=mock`（默认值）在零模型下载的情况下运行完整的摄入→检索→引用管线——可在毫秒内完成测试。
 - **真实的本地模型**通过 `llama-cpp-python`（GGUF 格式）在 Metal（Apple Silicon）、CUDA 或 CPU 上运行。
-- **设计上即支持离线。** 前端是手写原生 HTML/CSS/JS，零外部依赖——无 CDN script 标签，无 npm 构建步骤。字体以本地 `.woff2` 文件形式内置；图标为手写内联 SVG。
+- **设计上即支持离线。** 前端是手写原生 HTML/CSS/JS，零外部依赖——无 CDN script 标签，无 npm 构建步骤。字体以本地 `.woff2` 文件形式内置；图标为手写/本地内置为 `.svg` 文件（无图标 CDN）。
 - **离线能力已验证。** 整个测试套件在 `pytest-socket` 阻止所有真实网络访问的情况下运行，包含一个正向控制测试来证明该阻止确实生效。
 
 ### 📄 基于聊天的 RAG 与确定性反幻觉
@@ -60,11 +69,17 @@
 - 文件在拖入时暂存，在你按下发送的瞬间开始处理：**提取→分块→嵌入→索引**。
 - 每个文件的状态动画（`等待中→提取中→分块中→嵌入中→已索引`）由真实后端 SSE 事件驱动，而非虚假的定时器。
 - 每种文件类型都经过同一条管线——`Ingestor` 协议使得日后支持音频/视频时无需修改下游任何代码。
+- 作为独立的后台任务（`IngestionWorker`）运行，独立于你的 HTTP 连接——关闭标签页或在上传过程中断网都不会暂停或丢失正在进行的提取→分块→嵌入→索引工作；重新打开该对话会实时重新连接到它。
 
 ### 🔄 持久化、独立于连接的生成
-- 从你按下发送的那一刻起，消息生成就作为**后台任务**运行，独立于你的 HTTP 连接。
+- 从你按下发送的那一刻起，消息生成就作为**后台任务**（`GenerationWorker`）运行，独立于你的 HTTP 连接，拥有与摄入任务分离的独立队列——嵌入操作只会等待前一个嵌入操作，绝不会等待无关的 LLM 生成。
 - 在回答生成过程中刷新页面——回答会继续生成并最终写入数据库。重新加载后可以实时重新连接到它，无论它进行到了哪一步。
-- 崩溃恢复：启动时，任何因上次进程异常终止而卡在生成中途的消息会被标记为错误状态，并保留其已生成的部分内容，而不是永远空转等待。
+- 崩溃恢复：启动时，任何因上次进程异常终止而卡在处理中途的消息或文档都会被标记为错误状态，并保留其已生成的部分内容，而不是永远空转等待。
+
+### ⚙️ 内置模型管理
+- 设置菜单会列出 `models/` 中的每个 `.gguf` 文件，仅根据其自身元数据（一个池化层标记）而非文件名，将其分类为 LLM 模型或嵌入模型——无需维护一份硬编码的模型名称列表来应对不断出现的新架构。
+- 直接从设置中下载模型（Hugging Face Hub，带实时进度），无需先运行单独的命令行步骤。
+- 切换当前使用的 LLM 或嵌入模型会保存该选择并重启应用，以便新模型真正被加载；删除模型文件也以同样的方式提供。
 
 ### 🧱 可插拔架构
 每一层都位于协议/ABC 之后——无需重构即可替换实现：
@@ -202,7 +217,7 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
     citations: list[Citation]
-    status: MessageStatus  # 排队中 → 检索中 → 生成中 → 完成 | 错误
+    status: MessageStatus  # 排队中 → 处理文档中 → 检索中 → 生成中 → 完成 | 错误
     created_at: datetime
 ```
 
@@ -229,8 +244,8 @@ docker compose up --build
 如需真实的本地推理，挂载你的模型并切换驱动：
 
 ```bash
-# 首先，下载 GGUF 模型到 data/models/（一次性操作）：
-make download-models
+# 首先，下载 GGUF 模型到 models/（一次性操作）：
+python scripts/download_models.py
 
 # 然后覆盖 Compose 环境变量：
 LLM_DRIVER=llama_cpp EMBEDDER=llama_cpp docker compose up --build
@@ -260,15 +275,16 @@ make run
 | 变量 | 用途 |
 |---|---|
 | `LLM_DRIVER` | `mock`（默认，零下载）或 `llama_cpp`（真实本地 GGUF 推理）。 |
-| `LLM_MODEL_PATH` | GGUF 文件路径。仅当 `LLM_DRIVER=llama_cpp` 时使用。 |
+| `LLM_MODEL_PATH` | GGUF 文件路径。仅当 `LLM_DRIVER=llama_cpp` 时使用。留空则使用“设置”菜单中选定的模型。 |
 | `LLM_CONTEXT_WINDOW` | 上下文窗口大小（默认根据 `MEMORY_TIER` 自动检测，通常为 `8192`）。 |
 | `LLM_GPU_LAYERS` | 卸载到 GPU 的层数（`-1` = 全部，默认）。 |
 | `EMBEDDER` | `mock`（默认）或 `llama_cpp`。 |
-| `EMBEDDING_MODEL_PATH` | GGUF 嵌入模型路径。仅当 `EMBEDDER=llama_cpp` 时使用。 |
+| `EMBEDDING_MODEL_PATH` | GGUF 嵌入模型路径。仅当 `EMBEDDER=llama_cpp` 时使用。留空则使用“设置”菜单中选定的模型。 |
 | `EMBEDDING_GPU_LAYERS` | 嵌入 GPU 层数（默认 `0`——嵌入在 CPU 上运行，以避免与 LLM 争抢 GPU）。 |
 | `VECTOR_INDEX_BACKEND` | `flat`（float32，精确）或 `quantized`（int8 标量量化，约 4 倍内存节省）。 |
 | `RETRIEVAL_TOP_K` | 每次查询检索的文本块数量（默认 `5`）。 |
 | `RETRIEVAL_MIN_SIMILARITY` | 余弦相似度阈值，低于此值引擎拒绝回答（默认 `0.22`——针对 nomic-embed-text-v2-moe 校准）。 |
+| `MODELS_DIR` | 扫描 `.gguf` 模型文件的目录（默认 `models`）。 |
 | `DATABASE_PATH` | SQLite 数据库路径（默认 `data/keepr.db`）。 |
 | `INDEX_DIR` | 按对话的向量索引目录（默认 `data/index`）。 |
 | `UPLOAD_DIR` | 上传文件存储目录（默认 `data/uploads`）。 |
@@ -279,8 +295,16 @@ make run
 
 ### 使用真实本地模型运行
 
+安装 `llama_cpp` 驱动——一个单独的、更重的可选依赖（从源码编译 `llama-cpp-python`；在 Apple Silicon 上会自动启用 Metal 加速，无需额外参数）：
+
 ```bash
-make download-models   # 获取 Qwen3-8B + nomic-embed-text-v2-moe GGUF 模型对（总计约 7.5 GB）
+pip install -e ".[llama]"
+```
+
+然后可以从应用的**设置**菜单获取 Qwen3-8B + nomic-embed-text-v2-moe GGUF 模型对（总计约 7.5 GB），也可以通过命令行：
+
+```bash
+python scripts/download_models.py
 ```
 
 然后在 `.env` 中：
@@ -291,6 +315,8 @@ EMBEDDER=llama_cpp
 ```
 
 重启 `make run`。第一条消息会较慢（模型加载到内存中）；之后的一切都在驻留的热堆栈上运行。
+
+如果想使用不同的模型，将任何 llama.cpp 兼容的 GGUF 文件放入 `models/`，然后在**设置**菜单中选它——选择会被保存并在下次重启时生效。你也可以直接设置 `LLM_MODEL_PATH` / `EMBEDDING_MODEL_PATH` 来覆盖它。（嵌入模型不能随意更换：`RETRIEVAL_MIN_SIMILARITY` 是针对 nomic-embed-text-v2-moe 校准的，更换意味着需要重新校准该阈值。）
 
 ### 原生桌面应用（macOS）
 
@@ -319,11 +345,15 @@ keepr/
 │   ├── config.py              # 硬件检测、内存层级、设置
 │   ├── concurrency.py         # LockedEmbedder / LockedLLMDriver 封装器
 │   ├── logger.py              # 结构化日志
+│   ├── download.py            # 模型下载辅助（Hugging Face Hub，与 CLI 共用）
+│   ├── gguf_meta.py           # 轻量级 GGUF 元数据分类器（pooling 检测）
+│   ├── model_unavailable.py   # ModelUnavailableError —— 按角色区分的缺失/损坏 GGUF 文件
 │   ├── api/
 │   │   ├── app.py             # FastAPI 应用工厂 + 生命周期
 │   │   ├── context.py         # AppContext + 依赖注入
 │   │   ├── routes_conversations.py
 │   │   ├── routes_messages.py # 多路复用 SSE 端点
+│   │   ├── routes_models.py   # 模型状态/选择/下载端点
 │   │   └── sse.py             # SSE 格式化辅助函数
 │   ├── db/
 │   │   ├── pool.py            # SQLiteConnectionPool
@@ -337,6 +367,7 @@ keepr/
 │   ├── ingestion/
 │   │   ├── base.py            # Ingestor 协议
 │   │   ├── pipeline.py        # 编排 提取→分块→嵌入→索引
+│   │   ├── worker.py          # 后台任务——持久化、独立于连接
 │   │   ├── chunker.py         # 带重叠的文本分块
 │   │   ├── registry.py        # 为文件找到合适的摄入器
 │   │   ├── pdf_ingestor.py
@@ -372,9 +403,11 @@ keepr/
 │   ├── src/lib.rs
 │   └── binaries/              # PyInstaller 编译的后端可执行文件
 ├── tests/                     # pytest + pytest-asyncio + pytest-socket
+├── models/                    # 已下载的 .gguf 模型权重（MODELS_DIR）
 ├── scripts/
-│   └── download_models.py     # 一次性 GGUF 模型下载器（唯一涉及网络的脚本）
+│   └── download_models.py     # 一次性 GGUF 模型下载器（免测试的网络脚本）
 ├── assets/                    # Logo、截图
+│   └── icons/                 # 下载按钮使用的白色品牌图标
 ├── ARCHITECTURE.md            # 完整技术设计与扩展方案
 ├── CLAUDE.md                  # AI 助手 / 贡献者指南
 ├── Makefile
@@ -388,13 +421,14 @@ keepr/
 ```bash
 make install          # pip install -e ".[dev]"
 make run              # uvicorn src.api.app:app --reload --port 8000
-make download-models  # 获取 GGUF 模型（唯一涉及网络的步骤）
 make test             # pytest
 make lint             # ruff check .
 make typecheck        # mypy --strict
 make ci               # lint + typecheck + test——在认为完成之前应运行此命令
 make clean            # 清除数据库/索引/上传文件（应用状态）——不包括模型权重
-make clean-models     # 同时清除 data/models/
+make clean-models     # 同时清除 models/
+make wipe             # 完全重置到刚克隆时的状态（venv、缓存、
+                       # 构建产物、src-tauri/target 等）——models/ 仍然保留不动
 ```
 
 ### 测试
@@ -408,6 +442,7 @@ make ci   # ruff check . && mypy && pytest
 关键测试文件：
 - `tests/test_rag_engine.py`——基于阈值的拒绝、引用验证（包括一个刻意伪造引用的驱动）
 - `tests/test_generation_worker.py`——独立于连接的生成、崩溃恢复、观察者重新连接
+- `tests/test_ingestion_worker.py`——独立于连接的文档摄入、崩溃恢复、空闲卸载的时序
 - `tests/test_ingestion_pipeline.py`——内容哈希去重、状态转换
 - `tests/test_vectorstore.py`——量化内存比率及 top-1 一致性基准
 - `tests/test_airgapped.py`——正向控制，证明套接字阻止确实生效
@@ -452,7 +487,6 @@ make ci   # ruff check . && mypy && pytest
 - **真实的音频/视频转录。** `AudioVideoIngestor.extract()` 目前抛出 `UnsupportedSourceError`。计划：`faster-whisper`，延迟加载，使用后释放内存。
 - **对话历史截断/摘要。** 长对话目前每轮都将完整历史发送给模型。
 - **BM25/关键词搜索与向量搜索融合**（倒数秩融合）——添加成本低，可以捕捉嵌入遗漏的精确术语查询。
-- **文件摄入的断连容错。** 摄入在请求中内联运行；上传中途刷新页面会使文档卡在半途状态（尽管已持久化的文本块不受影响）。用于消息的 `GenerationWorker` 所用的相同模式可以直接推广。
 - **一个标注的依据评估集**（30-50 个问题，涵盖可回答/不可回答/对抗性类别，CI 强制执行）——机制已经过测试；更广泛的统计框架是自然的下一步。
 
 ---

@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from src.vectorstore.similarity import l2_normalize_rows
+from src.vectorstore.similarity import l2_normalize_rows, select_top_k
 
 
 class NumpyFlatIndex:
@@ -39,12 +39,7 @@ class NumpyFlatIndex:
             return []
         normalized_query = l2_normalize_rows(query.reshape(1, -1).astype(np.float32, copy=False))[0]
         scores = self._vectors @ normalized_query
-        k = min(top_k, len(self._ids))
-        if k <= 0:
-            return []
-        top_indices = np.argpartition(-scores, k - 1)[:k]
-        top_indices = top_indices[np.argsort(-scores[top_indices])]
-        return [(self._ids[i], float(scores[i])) for i in top_indices]
+        return select_top_k(self._ids, scores, top_k)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

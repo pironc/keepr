@@ -13,7 +13,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import TracebackType
 
 import aiosqlite
 
@@ -80,15 +79,3 @@ class SQLiteConnectionPool:
             await connection.close()
         self._connections.clear()
         self._pool = None
-
-    async def __aenter__(self) -> SQLiteConnectionPool:
-        await self._ensure_started()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.close()

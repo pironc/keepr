@@ -14,14 +14,25 @@
 </head>
 <body>
   <script>
-    // Stamp persisted collapse states on <html> before first paint so the
-    // grid never flashes the wrong column widths.  CSS mirrors these onto
-    // the same grid-template-columns that [data-sidebar] / [data-sources-panel]
-    // use at runtime — see app.css for the paired :root rules.
+    // Stamp persisted collapse + zoom state on <html> before first paint so
+    // neither the grid nor the zoomed root font-size ever flashes the
+    // default state for a single frame.  CSS mirrors the collapse classes
+    // onto the same grid-template-columns that [data-sidebar] /
+    // [data-sources-panel] use at runtime — see app.css for the paired
+    // :root rules.  ZOOM_LEVELS is duplicated from app.js on purpose: this
+    // script runs before app.js loads and this app has no module system to
+    // share a constant across the two files — keep both in sync if either
+    // is edited (see the matching comment in app.js).
     (function(){
       var h = document.documentElement;
       if (localStorage.getItem("sidebar-collapsed") === "1") h.classList.add("sb-coll");
       if (localStorage.getItem("sources-collapsed") === "1") h.classList.add("sp-coll");
+
+      var ZOOM_LEVELS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+      var zi = parseInt(localStorage.getItem("zoom-index"), 10);
+      if (Number.isInteger(zi) && zi >= 0 && zi < ZOOM_LEVELS.length) {
+        h.style.setProperty("--zoom", String(ZOOM_LEVELS[zi]));
+      }
     })();
   </script>
   <div class="app">
@@ -47,7 +58,9 @@
         <span class="new-chat-label">Search</span>
       </button>
       <div class="sidebar-section-label" id="recents-label">Recents</div>
-      <div id="conversation-list" class="conversation-list"></div>
+      <div class="sidebar-conversations">
+        <div id="conversation-list" class="conversation-list"></div>
+      </div>
     </aside>
     <script>
       // Apply sidebar collapsed class before paint (mirrors the html.sb-coll
@@ -64,19 +77,22 @@
       <div id="staged-tray" class="staged-tray"></div>
 
       <form id="composer" class="composer">
+        <div class="composer-side" id="composer-side-left"
+             aria-label="Composer left controls">
+          <button id="settings-btn" class="settings-btn icon-btn" type="button" title="Settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
         <div id="drop-zone" class="drop-zone">
           <textarea
             id="prompt-input"
             rows="1"
-            placeholder="Ask a question, or drop a file to add it to this conversation..."
+            placeholder="Ask a question, or drop a file to add it to this conversation"
+            disabled
           ></textarea>
-          <button type="button" id="mic-btn" class="icon-btn" title="Dictate (hold to speak)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="19" x2="12" y2="22" />
-            </svg>
-          </button>
           <input
             id="file-input"
             type="file"
@@ -96,6 +112,10 @@
             </svg>
           </button>
         </div>
+        <!-- Right-hand composer side-slot, mirrored with the left so the
+             input box stays dead-centred; a future control lands here. -->
+        <div class="composer-side" id="composer-side-right"
+             aria-label="Composer right controls"></div>
       </form>
     </main>
 
@@ -119,10 +139,20 @@
 
   <div id="delete-confirm" class="modal-backdrop" aria-hidden="true">
     <div class="confirm-card">
-      <p class="confirm-message" id="confirm-message"></p>
+      <div class="confirm-message" id="confirm-message"></div>
       <div class="confirm-actions">
         <button type="button" class="confirm-btn confirm-btn-cancel" id="confirm-cancel">Cancel</button>
         <button type="button" class="confirm-btn confirm-btn-delete" id="confirm-delete">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="restart-confirm" class="modal-backdrop" aria-hidden="true">
+    <div class="confirm-card">
+      <div class="confirm-message" id="restart-confirm-message"></div>
+      <div class="confirm-actions">
+        <button type="button" class="confirm-btn confirm-btn-cancel" id="restart-confirm-cancel">Cancel</button>
+        <button type="button" class="confirm-btn confirm-btn-restart" id="restart-confirm-ok">Restart</button>
       </div>
     </div>
   </div>
@@ -179,6 +209,52 @@
       <p>Drop files to add them to this conversation</p>
     </div>
   </div>
+
+  <div id="settings-overlay" class="settings-overlay" aria-hidden="true">
+    <div class="settings-popup">
+      <div class="settings-popup-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="settings-header-icon">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        <span class="settings-heading">Models</span>
+        <button type="button" id="settings-close" class="icon-btn" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="settings-body" id="settings-body">
+        <!-- Populated by JS: driver info + model status rows -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Download notification stack: one toast node per model download, stacked
+       bottom-up (newest at the bottom).  Each node is a clone of the template
+       below; JS mounts/unmounts them so a queued second download gets its own
+       pill rather than reusing one. -->
+  <div class="toast-stack" id="toast-stack" role="status" aria-live="polite"></div>
+  <div id="zoom-toast" class="zoom-toast" role="status" aria-live="polite" hidden></div>
+  <template id="download-toast-template">
+    <!-- Persistent download-into-tray glyph: it is the whole collapsed toast, and
+         the leading icon of the expanded one (which adds a text label + %).
+         During an active download the toast becomes cancellable: the download
+         glyph morphs into an X on hover and clicking aborts the transfer. Both
+         SVGs live in one sizing wrapper so the swap never causes a reflow. -->
+    <div class="download-toast" role="status">
+      <div class="download-toast-icon" aria-hidden="true">
+        <svg class="download-toast-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <svg class="download-toast-cancel-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+        </svg>
+      </div>
+    </div>
+  </template>
 
   <script src="/static/app.js"></script>
 </body>

@@ -1,13 +1,186 @@
 name: Release
 
+# Two triggers, two responsible workflows:
+#   - branch push to `master`  -> build the desktop app for macOS + Windows +
+#     Linux and publish every bundle to the perpetual `latest` GitHub Release
+#     (see `build` + `publish` jobs), so the README download buttons always
+#     serve the newest build for each platform.
+#   - `v*` tag push            -> publish the Docker image to GHCR (see `docker`
+#     job), for a conventionally-versioned container.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [master]
+    tags: ["v*"]
 
 jobs:
+  # ── Desktop builds → one artifact per platform/arch ───────────────
+  # One matrix leg per (platform × arch). Each leg builds the PyInstaller
+  # backend natively and produces the Tauri bundles for that platform, then
+  # uploads a flat set of normalized artifacts. A single `publish` job later
+  # merges them into the `latest` release (keeps concurrent legs from racing on
+  # the same release).
+  build:
+    if: github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - token: macos-arm64
+            runnervar: macos-15
+            arch: aarch64
+            os: macos
+            target_triple: aarch64-apple-darwin
+            addata_sep: ":"
+            bin_ext: ""
+            bundles: app,dmg
+          - token: macos-x64
+            runnervar: macos-15-intel
+            arch: x86_64
+            os: macos
+            target_triple: x86_64-apple-darwin
+            addata_sep: ":"
+            bin_ext: ""
+            bundles: app,dmg
+          - token: windows-x64
+            runnervar: windows-latest
+            arch: x86_64
+            os: windows
+            target_triple: x86_64-pc-windows-msvc
+            addata_sep: ;
+            bin_ext: .exe
+            bundles: nsis,msi
+          - token: linux-x64
+            runnervar: ubuntu-latest
+            arch: x86_64
+            os: linux
+            target_triple: x86_64-unknown-linux-gnu
+            addata_sep: ":"
+            bin_ext: ""
+            bundles: appimage,deb
+    runs-on: ${{ matrix.runnervar }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (Tauri)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: pip install -e . pyinstaller
+
+      - name: Build backend binary (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller --onefile --name keepr-backend \
+            --add-data "src/web${{ matrix.addata_sep }}src/web" \
+            --hidden-import pypdf \
+            --hidden-import aiosqlite \
+            --hidden-import huggingface_hub \
+            backend_main.py
+
+      - name: Copy backend binary for Tauri
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          cp -- "dist/keepr-backend${{ matrix.bin_ext }}" \
+             "src-tauri/binaries/keepr-backend-${{ matrix.target_triple }}${{ matrix.bin_ext }}"
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Build Tauri bundles
+        shell: bash
+        run: |
+          cd src-tauri
+          cargo tauri build --bundles ${{ matrix.bundles }}
+
+      # Normalize bundles to stable per-platform filenames so the download URLs
+      # never change as the app version bumps.
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cd src-tauri/target/release/bundle
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            cp -- dmg/*.dmg "$RUNNER_TEMP/release-assets/keepr-mac-${{ matrix.arch }}.dmg"
+          elif [ "${{ matrix.os }}" = "windows" ]; then
+            cp -- nsis/*-setup.exe "$RUNNER_TEMP/release-assets/keepr-windows-${{ matrix.arch }}-setup.exe"
+            cp -- msi/*.msi "$RUNNER_TEMP/release-assets/keepr-windows-${{ matrix.arch }}.msi"
+          elif [ "${{ matrix.os }}" = "linux" ]; then
+            cp -- appimage/*.AppImage "$RUNNER_TEMP/release-assets/keepr-linux-${{ matrix.arch }}.AppImage"
+            cp -- deb/*.deb "$RUNNER_TEMP/release-assets/keepr-linux-${{ matrix.arch }}.deb"
+          fi
+          ls -la "$RUNNER_TEMP/release-assets"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepr-${{ matrix.token }}
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+  # ── Publish every build artifact to the "latest" release ─────────
+  publish:
+    # Only runs after all build legs succeed (and thus, via the build guard,
+    # only for branch pushes).
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: keepr-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la release-assets
+
+      - name: Upload to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: keepr latest build
+          body: |
+            Automatically built from the latest push to `master`.
+
+            **Downloads (pick your platform):**
+            - **macOS — Apple Silicon:** `keepr-mac-aarch64.dmg`
+            - **macOS — Intel:** `keepr-mac-x86_64.dmg`
+            - **Windows:** `keepr-windows-x86_64-setup.exe` (installer) / `.msi`
+            - **Linux:** `keepr-linux-x86_64.AppImage` / `.deb`
+          make_latest: true
+          files: release-assets/*
+
   # ── Docker image → GitHub Container Registry ──────────────────────
+  # Only on `v*` version tags (a branch push publishes no image).
   docker:
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -39,48 +212,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-  # ── macOS desktop app → GitHub Release ────────────────────────────
-  macos:
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        run: pip install pyinstaller
-
-      - name: Build backend binary (PyInstaller)
-        run: |
-          pyinstaller --onefile --name keepr-backend \
-            --add-data "src/web:src/web" \
-            --hidden-import pypdf \
-            --hidden-import aiosqlite \
-            backend_main.py
-
-      - name: Copy binary for Tauri
-        run: |
-          mkdir -p src-tauri/binaries
-          cp dist/keepr-backend src-tauri/binaries/keepr-backend-aarch64-apple-darwin
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
-      - name: Build Tauri .app and .dmg
-        run: |
-          cd src-tauri
-          cargo tauri build
-
-      - name: Upload .dmg to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: src-tauri/target/release/bundle/dmg/*.dmg
-          fail_on_unmatched: true
