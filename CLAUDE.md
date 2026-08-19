@@ -69,8 +69,10 @@ make clean                # wipes DB/index/uploads (app state) — NOT model wei
 # repo) — see the `publish` job's "Compute next version name" step. Default is
 # a patch bump; a `[minor]` marker anywhere in the triggering commit's message
 # bumps the minor number instead (and resets patch) — `git config alias.minor
-# '!git commit --allow-empty -m "[minor]" && git push'` gives you `git minor`
-# as a one-word way to push a real minor bump instead of the default hotfix.
+# '!git commit --allow-empty -m "[minor] $(git log -1 --pretty=%s)" && git push'`
+# gives you `git minor` as a one-word way to push a real minor bump instead
+# of the default hotfix, with the marker commit itself readable (its message
+# is "[minor] <subject of the last real commit>", not a bare "[minor]").
 # The README platform button row (macOS / Windows / Linux) points at the release page
 # for the user to pick their arch. Docker image publishes only on `v*` tags.
 # ARM Windows / ARM Linux are NOT built (PyInstaller-on-ARM is currently impractical
