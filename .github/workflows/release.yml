@@ -1,16 +1,22 @@
 name: Release
 
-# Two triggers, two responsible workflows:
-#   - branch push to `master`  -> build the desktop app for macOS + Windows +
+# Three triggers:
+#   - branch push to `master`   -> build the desktop app for macOS + Windows +
 #     Linux and publish every bundle to the perpetual `latest` GitHub Release
 #     (see `build` + `publish` jobs), so the README download buttons always
 #     serve the newest build for each platform.
-#   - `v*` tag push            -> publish the Docker image to GHCR (see `docker`
-#     job), for a conventionally-versioned container.
+#   - pull request into `master` -> runs the same `build` matrix as a dry run,
+#     so a broken platform build (e.g. a hung apt-get step) surfaces before
+#     merge instead of after. Never reaches `publish`: that job's own guard
+#     (`github.ref == 'refs/heads/master'`) never matches a PR ref.
+#   - `v*` tag push             -> publish the Docker image to GHCR (see
+#     `docker` job), for a conventionally-versioned container.
 on:
   push:
     branches: [master]
     tags: ["v*"]
+  pull_request:
+    branches: [master]
 
 jobs:
   # ── Desktop builds → one artifact per platform/arch ───────────────
@@ -20,7 +26,7 @@ jobs:
   # merges them into the `latest` release (keeps concurrent legs from racing on
   # the same release).
   build:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -147,8 +153,9 @@ jobs:
 
   # ── Publish every build artifact to the "latest" release ─────────
   publish:
-    # Only runs after all build legs succeed (and thus, via the build guard,
-    # only for branch pushes).
+    # Only runs after all build legs succeed. build's own guard now also
+    # allows pull_request (see top of file), so this job's ref check is what
+    # actually excludes PR runs from ever publishing.
     needs: build
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
@@ -165,12 +172,33 @@ jobs:
       - name: List artifacts
         run: ls -la release-assets
 
+      # Increments the release name's X.Y by 0.1 each run, rolling over at
+      # .9 (1.9 -> 2.0) rather than counting past 9 (no 1.10). Reads the
+      # PREVIOUS run's name off the release itself, so no repo file/commit
+      # is needed to persist it between runs; falls back to 1.0 (-> "1.1")
+      # the first time, or if the name doesn't parse.
+      - name: Compute next version name
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current=$(gh release view latest --repo "${{ github.repository }}" --json name -q .name 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+          current="${current:-1.0}"
+          major="${current%%.*}"
+          minor="${current#*.}"
+          minor=$((minor + 1))
+          if [ "$minor" -ge 10 ]; then
+            major=$((major + 1))
+            minor=0
+          fi
+          echo "name=Keepr v${major}.${minor}" >> "$GITHUB_OUTPUT"
+
       - name: Upload to "latest" release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           target_commitish: ${{ github.sha }}
-          name: keepr latest build
+          name: ${{ steps.version.outputs.name }}
           body: |
             Automatically built from the latest push to `master`.
 
