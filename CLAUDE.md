@@ -27,14 +27,19 @@ connection open, that's a bug, not a UI detail to work around.
 
 keepr is a privacy-first, local-first RAG chat app: drop in documents,
 ask questions, get answers grounded only in what was uploaded, with
-citations, entirely offline-capable. `LLM_DRIVER`/`EMBEDDER` default to
-`llama_cpp` the moment a real GGUF is actually present at the resolved
-model path (env var > Settings-menu selection > default filename) and to
-`mock` otherwise (`src/config.py`'s `_default_driver`) — mock needs zero
-model downloads for a fresh checkout, and the packaged desktop app has no
-shell to set an env var in, so a model downloaded/selected via Settings
-just works with no separate driver toggle. An explicit `LLM_DRIVER`/
-`EMBEDDER` env var always overrides this auto-detection either way.
+citations, entirely offline-capable. In dev/CI, `LLM_DRIVER`/`EMBEDDER`
+default to `llama_cpp` the moment a real GGUF is actually present at the
+resolved model path (env var > Settings-menu selection > default filename)
+and to `mock` otherwise (`src/config.py`'s `_default_driver`) — mock needs
+zero model downloads for a fresh checkout. The packaged desktop app
+(`KEEPR_FROZEN`, set by `backend_main.py` when running from the PyInstaller
+bundle) always defaults to `llama_cpp` instead, even with no model
+downloaded yet: an end user must see the real "no model installed" refusal
+(`RagEngine.answer`'s availability gate / `ModelUnavailableError`), never a
+silent, meaningless answer from the mock driver — mock is a dev/test
+convenience, not something a real user should ever hit unknowingly. An
+explicit `LLM_DRIVER`/`EMBEDDER` env var always overrides this
+auto-detection either way.
 
 "Offline-capable" describes what a user can choose, not a constraint the
 app enforces on itself: `huggingface_hub` is a base dependency (not an
