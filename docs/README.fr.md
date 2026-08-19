@@ -66,40 +66,30 @@ La plupart des outils RAG envoient vos documents à une API cloud (risque de con
 
 ## Fonctionnalités
 
-### 🔒 Vie privée et fonctionnement air-gapped
-- **Entièrement local par défaut.** `LLM_DRIVER=mock` / `EMBEDDER=mock` (les valeurs par défaut) exécutent l'ensemble du pipeline d'ingestion → récupération → citation sans aucun téléchargement de modèle — testable en millisecondes.
-- **De vrais modèles locaux** via `llama-cpp-python` (format GGUF) sur Metal (Apple Silicon), CUDA ou CPU.
-- **Air-gapped par conception.** Le frontend est écrit en HTML/CSS/JS vanilla à la main avec zéro dépendance externe — aucun tag script CDN, aucune étape de build npm. Les polices sont vendues localement en fichiers `.woff2` ; les icônes sont codées à la main / vendues localement en fichiers `.svg` (aucun CDN d'icônes).
-- **Air-gapped prouvé.** La suite de tests complète s'exécute avec `pytest-socket` bloquant tout accès réseau réel, y compris un test de contrôle positif prouvant que le blocage est effectivement actif.
+### Vie privée et fonctionnement air-gapped
+- `LLM_DRIVER=mock` / `EMBEDDER=mock` (les valeurs par défaut) exécutent l'ensemble du pipeline d'ingestion → récupération → citation sans aucun téléchargement de modèle, testable en millisecondes ; l'inférence réelle passe par `llama-cpp-python` sur des modèles GGUF (Metal, CUDA ou CPU).
+- Le frontend est écrit en HTML/CSS/JS vanilla sans aucune dépendance externe — aucun script CDN, aucune étape de build npm, aucune police d'icônes — polices et icônes étant vendues localement en fichiers `.woff2`/`.svg`.
+- La suite de tests s'exécute avec `pytest-socket` bloquant tout accès réseau réel, y compris un test de contrôle positif qui échoue si ce blocage est un jour désactivé silencieusement.
 
-### 📄 RAG fondé sur le chat avec anti-hallucination déterministe
-- Chaque réponse est étayée par des extraits récupérés à partir des documents *de cette conversation* — pas un index global, pas les données de pré-entraînement du modèle.
-- **Refus pré-LLM :** si aucune similarité cosinus d'extrait ne franchit le seuil, keepr refuse *avant* que le LLM ne soit jamais appelé — une comparaison `float` déterministe, pas un jugement confié au modèle.
-- **Vérification post-génération des citations :** après que le LLM a diffusé sa réponse, chaque tag de citation `[chunk_N]` est vérifié par rapport à l'ensemble des identifiants d'extraits effectivement récupérés pour ce tour. Le modèle ne peut pas fabriquer une citation vers un document qui n'a jamais été devant lui — ceci est garanti par un test d'appartenance ensembliste, pas en faisant confiance à la sortie du modèle.
-- **Seuillage individuel par extrait :** chaque extrait récupéré est vérifié individuellement par rapport à la barre de similarité, pas seulement le meilleur — un seul résultat fort ne peut pas entraîner plusieurs extraits à peine pertinents dans le contexte.
+### Anti-hallucination déterministe
+- La récupération est circonscrite aux documents de cette conversation, jamais à un index global ni aux données de pré-entraînement du modèle.
+- Sous un seuil de similarité cosinus, vérifié extrait par extrait (pas seulement sur le meilleur résultat), keepr refuse *avant* que le LLM ne soit jamais appelé (`src/rag/engine.py`) — une comparaison `float`, pas un jugement confié au modèle.
+- Après génération, chaque citation `[chunk_N]` est vérifiée par appartenance ensembliste par rapport aux identifiants d'extraits effectivement récupérés pour ce tour, de sorte qu'une citation fabriquée est rejetée plutôt qu'acceptée sur parole.
 
-### 🗂️ Périmètre de récupération par conversation
-- Chaque conversation a son propre périmètre de récupération, comme un Projet Claude ou un carnet NotebookLM.
-- La barre latérale permet de basculer entre les conversations, de rechercher par titre, d'épingler les favoris, et de renommer ou supprimer en ligne via un menu contextuel au clic droit.
-- Les documents sont dédupliqués par hachage de contenu (SHA-256) — rattacher le même fichier est une opération nulle, pas une duplication silencieuse de chaque extrait.
+### Conversations et documents
+- Chaque conversation constitue son propre périmètre de récupération — comme un Projet Claude ou un carnet NotebookLM — avec recherche dans la barre latérale, épinglage, et renommage/suppression en ligne via un menu contextuel.
+- Les documents sont dédupliqués par hachage de contenu SHA-256 — rattacher à nouveau le même fichier est une opération nulle, pas un doublon d'extraits.
 
-### ⚡ Pipeline d'ingestion en direct
-- Un fichier est mis en attente au dépôt et traité dès que vous appuyez sur envoyer : **extraire → segmenter → vectoriser → indexer**.
-- Une animation de statut par fichier (`mis en attente → extraction → segmentation → vectorisation → indexé`) est pilotée par de vrais événements SSE du backend, pas par un faux minuteur.
-- Chaque type de fichier passe par le même pipeline — le protocole `Ingestor` est ce qui rend le support audio/vidéo extensible ultérieurement sans toucher à rien en aval.
-- S'exécute comme sa propre tâche de fond (`IngestionWorker`), indépendante de votre connexion HTTP — fermer l'onglet ou perdre le réseau en plein envoi ne met pas en pause et ne perd pas le travail extraire→segmenter→vectoriser→indexer en cours ; rouvrir la conversation s'y rattache en direct.
+### Tâches de fond durables
+- L'ingestion (`IngestionWorker`) et la génération (`GenerationWorker`) s'exécutent chacune sur leur propre file pilotée par la base de données, indépendante de toute connexion HTTP — une vectorisation n'attend jamais qu'une génération LLM sans rapport, seulement une vectorisation précédente. Fermer l'onglet, perdre le réseau ou rafraîchir la page en plein milieu d'une réponse ne met jamais en pause ni ne perd le travail en cours — rouvrir la conversation s'y rattache en direct via SSE.
+- Au redémarrage, tout ce qui a été laissé en cours de traitement par un crash précédent est marqué comme erroné avec son contenu partiel préservé, plutôt que de rester bloqué indéfiniment.
+- Chaque type de fichier passe par le même protocole `Ingestor` — un statut par fichier (`mis en attente → extraction → segmentation → vectorisation → indexé`) piloté par de vrais événements SSE, pas par un faux minuteur — ce qui rend un futur format (par exemple audio/vidéo, actuellement un `AudioVideoIngestor` — stub propre qui lève `UnsupportedSourceError` plutôt qu'un crash ou un no-op silencieux) ajoutable sans toucher à rien en aval.
 
-### 🔄 Génération durable et indépendante de la connexion
-- Dès que vous appuyez sur envoyer, la génération du message s'exécute en tant que **tâche de fond** (`GenerationWorker`) indépendante de votre connexion HTTP, sur sa propre file séparée de celle de l'ingestion — une vectorisation n'attend jamais qu'une génération LLM sans rapport, seulement une vectorisation précédente.
-- Rafraîchissez la page au milieu d'une réponse — la réponse continue de se générer et arrive dans la base de données quoi qu'il arrive. Le rechargement s'y rattache en direct, où qu'elle en soit.
-- Récupération après crash : au démarrage, tout message ou document bloqué en cours de traitement suite à la mort d'un processus précédent est marqué comme erroné avec son contenu partiel préservé, plutôt que de rester bloqué indéfiniment.
+### Gestion des modèles intégrée
+- Le menu Réglages liste chaque `.gguf` présent dans `models/`, classé comme modèle LLM ou de vectorisation à partir de ses propres métadonnées (une clé de couche de pooling), jamais d'après le nom de fichier.
+- Les modèles se téléchargent directement depuis Hugging Face Hub avec une progression en direct ; changer le modèle actif enregistre le choix et redémarre l'application pour que le nouveau modèle se charge réellement — la suppression d'un fichier de modèle fonctionne de la même façon.
 
-### ⚙️ Gestion des modèles intégrée
-- Le menu Réglages liste chaque `.gguf` présent dans `models/`, classé comme modèle LLM ou de vectorisation à partir de ses propres métadonnées (une clé de couche de pooling), jamais d'après le nom de fichier — aucune liste de noms de modèles codée en dur à maintenir à mesure que de nouvelles architectures apparaissent.
-- Téléchargez un modèle directement depuis Réglages (Hugging Face Hub, avec progression en direct) plutôt que d'exécuter d'abord une étape CLI séparée.
-- Changer le modèle LLM ou de vectorisation actif enregistre le choix et redémarre l'application pour que le nouveau modèle se charge réellement ; la suppression d'un fichier de modèle est disponible de la même façon.
-
-### 🧱 Architecture enfichable
+### Architecture enfichable
 Chaque couche est derrière un protocole/ABC — remplacez les implémentations sans restructurer :
 
 | Couche | Interface | Implémentations |
@@ -110,10 +100,9 @@ Chaque couche est derrière un protocole/ABC — remplacez les implémentations 
 | **Extracteur** | `Ingestor` | `PdfIngestor`, `TextIngestor`, `AudioVideoIngestor` (stub propre — lève `UnsupportedSourceError`) |
 | **Stockage** | `Repository` | SQLite via `aiosqlite` (le seul module qui parle SQL — le passage à Postgres est un changement d'un seul fichier) |
 
-### 🖥️ Application bureau native
-- Un wrapper [Tauri](https://tauri.app/) v2 empaquète le backend Python (compilé via PyInstaller) dans un bundle natif macOS `.app` et un installateur `.dmg`.
-- Aucune installation Python requise sur la machine cible — le backend est un binaire autonome intégré dans l'application.
-- La même base de code fonctionne comme application web (`make run` pour le développement avec rechargement à chaud) ou comme application bureau native (`make tauri-build` pour la distribution).
+### Application bureau native
+- Un wrapper [Tauri](https://tauri.app/) v2 empaquète un backend compilé via PyInstaller dans des installateurs natifs — `.app`/`.dmg` sur macOS, `.exe`/`.msi` sur Windows, `.AppImage`/`.deb` sur Linux — via une matrice de build CI, sans installation Python requise sur la machine cible.
+- La même base de code fonctionne comme application web (`make run`, rechargement à chaud) ou comme build bureau native (`make tauri-build`).
 
 ---
 
@@ -360,4 +349,4 @@ Exécutez d'abord `make install` — le paquet doit être installé en mode édi
 
 keepr est distribué sous la [licence MIT](../LICENSE).
 
-🤖 Généré avec [Claude Code](https://claude.com/claude-code)
+Généré avec [Claude Code](https://claude.com/claude-code)

@@ -66,41 +66,31 @@ Most RAG tools either send your documents to a cloud API (privacy risk) or wrap 
 
 ## Features
 
-### 🔒 Privacy & Air-Gapped Operation
-- **Fully local by default.** `LLM_DRIVER=mock` / `EMBEDDER=mock` (the defaults) run the entire ingestion → retrieval → citation pipeline with zero model downloads — testable in milliseconds.
-- **Real local models** via `llama-cpp-python` (GGUF format) on Metal (Apple Silicon), CUDA, or CPU.
-- **Air-gapped by design.** The frontend is hand-written vanilla HTML/CSS/JS with zero external dependencies — no CDN script tag, no npm build step. Fonts are vendored locally as `.woff2` files; icons are hand-authored / vendored locally as `.svg` files (no icon CDN).
-- **Proven air-gapped.** The entire test suite runs with `pytest-socket` blocking all real network access, including a positive-control test proving the block is actually active.
+### Privacy & air-gapped operation
+- `LLM_DRIVER=mock` / `EMBEDDER=mock` (the defaults) run the full ingestion → retrieval → citation pipeline with zero model downloads, testable in milliseconds; real inference is `llama-cpp-python` on GGUF models (Metal, CUDA, or CPU).
+- The frontend is dependency-free vanilla HTML/CSS/JS — no CDN script, no npm build, no icon font — with fonts and icons vendored locally as `.woff2`/`.svg` files.
+- The test suite runs under `pytest-socket` with all real network access blocked, including a positive-control test that fails if the block is ever silently disabled.
 
-### 📄 Chat-Grounded RAG with Deterministic Anti-Hallucination
-- Every answer is backed by chunks retrieved from the documents *in that conversation* — not a global index, not the model's pre-training data.
-- **Pre-LLM refusal:** If no retrieved chunk's cosine similarity clears the threshold, keepr refuses *before* the LLM is ever called — a deterministic `float` comparison, not a judgment call handed to the model.
-- **Post-generation citation verification:** After the LLM streams its answer, every `[chunk_N]` citation tag is checked against the set of chunk IDs actually retrieved that turn. The model cannot fabricate a citation to a document that was never in front of it — this is enforced by set membership, not by trusting the model's output.
-- **Individual per-chunk thresholding:** Every retrieved chunk is checked against the similarity bar individually, not just the best one — a single strong match can't drag several barely-related chunks into context.
+### Deterministic anti-hallucination
+- Retrieval is scoped to the documents in that conversation, never a global index or the model's pre-training data.
+- Below a cosine-similarity threshold, checked per-chunk (not just the best match), keepr refuses *before* the LLM is called (`src/rag/engine.py`) — a `float` comparison, not a judgment handed to the model.
+- After generation, every `[chunk_N]` citation is checked by set membership against the chunk IDs actually retrieved that turn, so a fabricated citation is rejected rather than trusted.
 
-### 🗂️ Per-Conversation Retrieval Scope
-- Each conversation is its own retrieval scope, like a Claude Project or a NotebookLM notebook.
-- The sidebar lets you switch between conversations, search by title, pin favorites, and rename or delete inline via a right-click context menu.
-- Documents are de-duplicated by content hash (SHA-256) — re-attaching the same file is a no-op, not a silent duplication of every chunk.
+### Conversations & documents
+- Each conversation is its own retrieval scope — like a Claude Project or a NotebookLM notebook — with sidebar search, pinning, and inline rename/delete via a context menu.
+- Documents are deduplicated by SHA-256 content hash — re-attaching the same file is a no-op, not a duplicated set of chunks.
 
-### ⚡ Live Ingestion Pipeline
-- A file is staged on drop and processed the moment you hit send: **extract → chunk → embed → index**.
-- A per-file status animation (`staged → extracting → chunking → embedding → indexed`) is driven by real backend SSE events, not a fake timer.
-- Every file type goes through the same pipeline — the `Ingestor` protocol is what makes audio/video support growable later without touching anything downstream.
-- Runs as its own background task (`IngestionWorker`), independent of your HTTP connection — closing the tab or losing network mid-upload doesn't pause or lose the in-progress extract→chunk→embed→index work; reopening the conversation reattaches to it live.
+### Durable background workers
+- Ingestion (`IngestionWorker`) and generation (`GenerationWorker`) each run on their own DB-driven queue independent of any HTTP connection, so an embedding only ever waits for a prior embedding, never for an unrelated LLM generation. Closing the tab, losing network, or refreshing mid-answer never pauses or loses work — reopening reattaches to it live over SSE.
+- On restart, anything left mid-processing by a prior crash is marked errored with its partial content preserved, rather than left spinning forever.
+- Every file type goes through the same `Ingestor` protocol — per-file status (`staged → extracting → chunking → embedding → indexed`) driven by real SSE events, not a fake timer — which is what makes a future format (e.g. audio/video, currently a stubbed `AudioVideoIngestor` that raises `UnsupportedSourceError` rather than a crash or silent no-op) addable without touching anything downstream.
 
-### 🔄 Durable, Connection-Independent Generation
-- The moment you hit send, message generation runs as a **background task** (`GenerationWorker`) independent of your HTTP connection, on its own queue separate from ingestion's — an embedding only ever waits for a prior embedding, never for an unrelated LLM generation.
-- Refresh the page mid-answer — the answer keeps generating and lands in the database regardless. Reloading reattaches to it live, wherever it's gotten to.
-- Crash recovery: on startup, any message or document stuck mid-processing from a previous process death is marked as errored with its partial content preserved, rather than left spinning forever.
+### In-app model management
+- Settings lists every `.gguf` in `models/`, classified as LLM or embedding by reading its own metadata (a pooling-layer key), never by filename.
+- Models download straight from Hugging Face Hub with live progress; switching the active model persists the choice and restarts the app so the new model actually loads — deleting a model file works the same way.
 
-### ⚙️ In-App Model Management
-- The Settings menu lists every `.gguf` in `models/`, classified as an LLM or embedding model from its own metadata (a pooling-layer key), never by filename — no hardcoded model-name list to keep in sync as new architectures show up.
-- Download a model straight from Settings (Hugging Face Hub, with live progress) instead of running a separate CLI step first.
-- Switching the active LLM or embedding model persists the choice and restarts the app so the new model actually loads; deleting a model file is available the same way.
-
-### 🧱 Pluggable Architecture
-Every layer is behind a protocol/ABC — swap implementations without restructuring:
+### Pluggable architecture
+Every layer sits behind a protocol/ABC — swap implementations without restructuring:
 
 | Layer | Interface | Implementations |
 |---|---|---|
@@ -108,12 +98,11 @@ Every layer is behind a protocol/ABC — swap implementations without restructur
 | **Embedder** | `Embedder` | `MockEmbedder` (hashing-trick bag-of-words), `LlamaCppEmbedder` (nomic-embed-text-v2-moe, multilingual) |
 | **Vector Index** | `VectorIndex` | `NumpyFlatIndex` (float32, exact), `QuantizedNumpyFlatIndex` (int8 scalar quant, ~4× less memory) |
 | **Ingestor** | `Ingestor` | `PdfIngestor`, `TextIngestor`, `AudioVideoIngestor` (clean stub — raises `UnsupportedSourceError`) |
-| **Storage** | `Repository` | SQLite via `aiosqlite` (the only module that speaks SQL — Postgres swap is a one-file change) |
+| **Storage** | `Repository` | SQLite via `aiosqlite` (the only module that speaks SQL — a Postgres swap is a one-file change) |
 
-### 🖥️ Native Desktop App
-- A [Tauri](https://tauri.app/) v2 wrapper bundles the Python backend (compiled via PyInstaller) into a native macOS `.app` bundle and `.dmg` installer.
-- Zero Python installation required on the target machine — the backend is a standalone binary embedded inside the app.
-- The same codebase runs as a web app (`make run` for development with hot reload) or as a native desktop app (`make tauri-build` for distribution).
+### Native desktop app
+- A [Tauri](https://tauri.app/) v2 wrapper bundles a PyInstaller-compiled backend into native installers — macOS `.app`/`.dmg`, Windows `.exe`/`.msi`, Linux `.AppImage`/`.deb` — via a CI build matrix, no Python install required on the target machine.
+- The same codebase runs as a web app (`make run`, hot reload) or a native desktop build (`make tauri-build`).
 
 ---
 
@@ -212,6 +201,17 @@ To use a different model, drop any llama.cpp-compatible GGUF into `models/` and 
 
 ### Native Desktop App (macOS)
 
+Prebuilt: grab the `.dmg` from the download badges above, or install via [Homebrew](https://brew.sh):
+
+```bash
+brew tap pironc/keepr https://github.com/pironc/keepr
+brew install --cask keepr
+```
+
+The Cask formula ([`Casks/keepr.rb`](Casks/keepr.rb)) always tracks the latest GitHub release — `brew upgrade --cask keepr` picks up new builds the same way.
+
+Build from source:
+
 ```bash
 # Development mode — opens a native window pointing at http://localhost:8000.
 # The Python backend must already be running (`make run` in another terminal).
@@ -222,7 +222,7 @@ make tauri-dev
 make tauri-build
 ```
 
-The compiled `.app` requires no Python installation on the target machine — the backend is a self-contained PyInstaller binary embedded inside the bundle.
+The compiled `.app` requires no Python installation on the target machine — the backend is a self-contained PyInstaller binary embedded inside the bundle. keepr isn't code-signed/notarized yet, so macOS will call it "damaged" on first open regardless of install method; the DMG's own background image (and `Casks/keepr.rb`'s caveat) both point at the fix: `xattr -cr /Applications/keepr.app`.
 
 ---
 
@@ -360,4 +360,4 @@ Run `make install` first — the package needs to be installed in editable mode.
 
 keepr is licensed under the [MIT License](LICENSE).
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+Generated with [Claude Code](https://claude.com/claude-code)

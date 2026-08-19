@@ -66,40 +66,30 @@ La mayoría de las herramientas RAG envían tus documentos a una API en la nube 
 
 ## Funcionalidades
 
-### 🔒 Privacidad y funcionamiento sin conexión
-- **Completamente local por defecto.** `LLM_DRIVER=mock` / `EMBEDDER=mock` (los valores predeterminados) ejecutan todo el proceso de ingesta → recuperación → citas sin necesidad de descargar modelos — comprobable en milisegundos.
-- **Modelos locales reales** mediante `llama-cpp-python` (formato GGUF) en Metal (Apple Silicon), CUDA o CPU.
-- **Aislado de la red por diseño.** El frontend está escrito a mano en HTML/CSS/JS vanilla sin dependencias externas — sin etiquetas script de CDN, sin paso de compilación npm. Las fuentes tipográficas están almacenadas localmente como archivos `.woff2`; los iconos están creados a mano / almacenados localmente como archivos `.svg` (sin CDN de iconos).
-- **Aislamiento de red comprobado.** Toda la suite de pruebas se ejecuta con `pytest-socket` bloqueando todo acceso real a la red, incluyendo una prueba de control positivo que demuestra que el bloqueo está realmente activo.
+### Privacidad y funcionamiento sin conexión
+- `LLM_DRIVER=mock` / `EMBEDDER=mock` (los valores predeterminados) ejecutan todo el proceso de ingesta → recuperación → citas sin descargar ningún modelo, comprobable en milisegundos; la inferencia real usa `llama-cpp-python` sobre modelos GGUF (Metal, CUDA o CPU).
+- El frontend es HTML/CSS/JS vanilla sin dependencias — sin script de CDN, sin paso de compilación npm, sin fuente de iconos — con fuentes tipográficas e iconos almacenados localmente como archivos `.woff2`/`.svg`.
+- La suite de pruebas se ejecuta con `pytest-socket` bloqueando todo acceso real a la red, incluyendo una prueba de control positivo que falla si ese bloqueo llega a desactivarse silenciosamente.
 
-### 📄 Chat RAG con anti-alucinación determinista
-- Cada respuesta está respaldada por fragmentos recuperados de los documentos *de esa conversación* — no de un índice global ni de los datos de preentrenamiento del modelo.
-- **Rechazo previo al LLM:** si ningún fragmento recuperado supera el umbral de similitud coseno, keepr rechaza la consulta *antes* de llamar al LLM — una comparación determinista de `float`, no un juicio delegado al modelo.
-- **Verificación de citas post-generación:** después de que el LLM transmite su respuesta, cada etiqueta de cita `[chunk_N]` se verifica contra el conjunto de IDs de fragmentos realmente recuperados en ese turno. El modelo no puede inventar una cita a un documento que nunca tuvo delante — esto se aplica por pertenencia a conjunto, no confiando en la salida del modelo.
-- **Umbral individual por fragmento:** cada fragmento recuperado se compara contra el umbral de similitud individualmente, no solo el mejor — una única coincidencia fuerte no puede arrastrar varios fragmentos apenas relacionados al contexto.
+### Anti-alucinación determinista
+- La recuperación está acotada a los documentos de esa conversación, nunca a un índice global ni a los datos de preentrenamiento del modelo.
+- Por debajo de un umbral de similitud coseno, comprobado por fragmento (no solo la mejor coincidencia), keepr rechaza la consulta *antes* de llamar al LLM (`src/rag/engine.py`) — una comparación de `float`, no un juicio delegado al modelo.
+- Tras la generación, cada cita `[chunk_N]` se verifica por pertenencia al conjunto de IDs de fragmentos realmente recuperados en ese turno, de modo que una cita inventada se rechaza en lugar de darse por buena.
 
-### 🗂️ Alcance de recuperación por conversación
-- Cada conversación tiene su propio alcance de recuperación, como un Proyecto de Claude o un cuaderno de NotebookLM.
-- La barra lateral te permite alternar entre conversaciones, buscar por título, fijar favoritas y renombrar o eliminar directamente mediante un menú contextual con clic derecho.
-- Los documentos se deduplican por hash de contenido (SHA-256) — volver a adjuntar el mismo archivo es una operación nula, no una duplicación silenciosa de cada fragmento.
+### Conversaciones y documentos
+- Cada conversación tiene su propio alcance de recuperación — como un Proyecto de Claude o un cuaderno de NotebookLM — con búsqueda en la barra lateral, favoritos y renombrado/eliminación en línea mediante un menú contextual.
+- Los documentos se deduplican por hash de contenido (SHA-256) — volver a adjuntar el mismo archivo es una operación nula, no un conjunto duplicado de fragmentos.
 
-### ⚡ Pipeline de ingesta en vivo
-- Un archivo se prepara al soltarlo y se procesa en el momento en que pulsas enviar: **extraer → fragmentar → incrustar → indexar**.
-- Una animación de estado por archivo (`staged → extracting → chunking → embedding → indexed`) se controla mediante eventos SSE reales del backend, no por un temporizador falso.
-- Cada tipo de archivo pasa por el mismo pipeline — el protocolo `Ingestor` es lo que hace que el soporte de audio/vídeo sea ampliable más adelante sin tocar nada posterior en la cadena.
-- Se ejecuta como su propia tarea en segundo plano (`IngestionWorker`), independiente de tu conexión HTTP — cerrar la pestaña o perder la red a mitad de una subida no pausa ni pierde el trabajo de extraer→fragmentar→incrustar→indexar en curso; volver a abrir la conversación se reconecta a él en vivo.
+### Trabajadores duraderos en segundo plano
+- La ingesta (`IngestionWorker`) y la generación (`GenerationWorker`) se ejecutan cada una en su propia cola controlada por la base de datos, independiente de cualquier conexión HTTP, de modo que una incrustación solo espera a una incrustación anterior, nunca a una generación de LLM no relacionada. Cerrar la pestaña, perder la red o recargar a mitad de una respuesta nunca pausa ni pierde el trabajo — al volver a abrir te reconectas a él en vivo por SSE.
+- Al reiniciar, cualquier elemento que quedó a mitad de proceso por una caída anterior se marca como erróneo con su contenido parcial preservado, en lugar de quedarse girando para siempre.
+- Cada tipo de archivo pasa por el mismo protocolo `Ingestor` — un estado por archivo (`staged → extracting → chunking → embedding → indexed`) controlado por eventos SSE reales, no por un temporizador falso — lo que hace que un formato futuro (por ejemplo audio/vídeo, hoy un `AudioVideoIngestor` stub que lanza `UnsupportedSourceError` en vez de fallar o no hacer nada) se pueda añadir sin tocar nada posterior en la cadena.
 
-### 🔄 Generación duradera e independiente de la conexión
-- En el momento en que pulsas enviar, la generación del mensaje se ejecuta como una **tarea en segundo plano** (`GenerationWorker`) independiente de tu conexión HTTP, en su propia cola separada de la ingesta — una incrustación solo espera a una incrustación anterior, nunca a una generación de LLM no relacionada.
-- Recarga la página a mitad de una respuesta — la respuesta sigue generándose y se guarda en la base de datos de todos modos. Al recargar, te reconectas a ella en vivo, esté donde esté.
-- Recuperación ante fallos: al iniciar, cualquier mensaje o documento atascado a mitad de proceso por una muerte anterior del proceso se marca como erróneo con su contenido parcial preservado, en lugar de quedarse girando para siempre.
+### Gestión de modelos integrada
+- Ajustes lista cada `.gguf` en `models/`, clasificado como LLM o de incrustación leyendo sus propios metadatos (una clave de capa de pooling), nunca por el nombre del archivo.
+- Los modelos se descargan directamente desde Hugging Face Hub con progreso en vivo; cambiar el modelo activo guarda la elección y reinicia la app para que el nuevo modelo se cargue de verdad — eliminar un archivo de modelo funciona igual.
 
-### ⚙️ Gestión de modelos integrada
-- El menú de Ajustes lista cada `.gguf` en `models/`, clasificado como modelo de LLM o de incrustación a partir de sus propios metadatos (una clave de capa de pooling), nunca por el nombre del archivo — sin lista de nombres de modelo codificada que mantener al día conforme aparecen nuevas arquitecturas.
-- Descarga un modelo directamente desde Ajustes (Hugging Face Hub, con progreso en vivo) en lugar de ejecutar primero un paso de CLI aparte.
-- Cambiar el modelo activo de LLM o de incrustación guarda la elección y reinicia la app para que el nuevo modelo se cargue de verdad; eliminar un archivo de modelo está disponible de la misma forma.
-
-### 🧱 Arquitectura conectable
+### Arquitectura conectable
 Cada capa está detrás de un protocolo/ABC — intercambia implementaciones sin reestructurar:
 
 | Capa | Interfaz | Implementaciones |
@@ -110,10 +100,9 @@ Cada capa está detrás de un protocolo/ABC — intercambia implementaciones sin
 | **Ingestor** | `Ingestor` | `PdfIngestor`, `TextIngestor`, `AudioVideoIngestor` (stub limpio — lanza `UnsupportedSourceError`) |
 | **Almacenamiento** | `Repository` | SQLite mediante `aiosqlite` (el único módulo que habla SQL — cambiar a Postgres es un cambio de un solo archivo) |
 
-### 🖥️ Aplicación de escritorio nativa
-- Un wrapper de [Tauri](https://tauri.app/) v2 empaqueta el backend Python (compilado con PyInstaller) en un bundle nativo `.app` de macOS y un instalador `.dmg`.
-- No se requiere ninguna instalación de Python en la máquina de destino — el backend es un binario independiente incrustado dentro de la aplicación.
-- El mismo código se ejecuta como aplicación web (`make run` para desarrollo con recarga en caliente) o como aplicación de escritorio nativa (`make tauri-build` para distribución).
+### Aplicación de escritorio nativa
+- Un wrapper de [Tauri](https://tauri.app/) v2 empaqueta un backend compilado con PyInstaller en instaladores nativos — `.app`/`.dmg` de macOS, `.exe`/`.msi` de Windows, `.AppImage`/`.deb` de Linux — mediante una matriz de compilación de CI, sin necesidad de instalar Python en la máquina de destino.
+- El mismo código se ejecuta como aplicación web (`make run`, recarga en caliente) o como build de escritorio nativo (`make tauri-build`).
 
 ---
 
@@ -360,4 +349,4 @@ Ejecuta `make install` primero — el paquete necesita instalarse en modo editab
 
 keepr está bajo la [Licencia MIT](../LICENSE).
 
-🤖 Generado con [Claude Code](https://claude.com/claude-code)
+Generado con [Claude Code](https://claude.com/claude-code)
