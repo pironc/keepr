@@ -6,7 +6,38 @@ explicit goal — how the design scales from a single laptop to a dedicated
 machine without a rewrite. If you only read one section, read
 ["Scaling past a laptop"](#scaling-past-a-laptop).
 
+- [What this actually does, end to end](#what-this-actually-does-end-to-end)
+- [Technology choices, and why](#technology-choices-and-why)
+- [Anti-hallucination is deterministic, not prompted](#anti-hallucination-is-deterministic-not-prompted)
+- [Per-conversation retrieval scope](#per-conversation-retrieval-scope)
+- [Resilient, queued message generation](#resilient-queued-message-generation)
+- [Wire format](#wire-format)
+- [Proving "air-gapped," not just claiming it](#proving-air-gapped-not-just-claiming-it)
+- [Scaling past a laptop](#scaling-past-a-laptop)
+- [Native desktop app (Tauri v2)](#native-desktop-app-tauri-v2)
+- [What's deliberately not built yet](#whats-deliberately-not-built-yet)
+- [Design principles](#design-principles)
+
 ## What this actually does, end to end
+
+```mermaid
+flowchart TD
+    %% Ingestion pipeline
+    Upload[File Upload] --> Ingestor[Ingestor: extract → TextSegments]
+    Ingestor --> Chunker[Chunker: TextSegments → Chunks]
+    Chunker --> Embedder[Embedder: Chunks → Vectors]
+    Embedder --> Index[VectorIndex: add vectors + metadata]
+
+    %% Query pipeline
+    Question[User Question] --> QEmbed[Embed Query]
+    QEmbed --> Search[VectorIndex.search: top-k chunks]
+    Search --> Threshold{Similarity > Threshold?}
+    Threshold -->|No| Refuse[Refuse — deterministic, pre-LLM]
+    Threshold -->|Yes| Ground[Ground in System Prompt: tag chunks]
+    Ground --> LLM[LLMDriver: stream answer token-by-token]
+    LLM --> Verify[Citation Verification: set-membership check]
+    Verify --> Response[SSE: tokens + citations + done]
+```
 
 1. You drop a file into a conversation and hit send. The file is **staged
    client-side only** — nothing is uploaded until you submit.
@@ -201,6 +232,77 @@ the actual work — a conversation's Sources panel would still freeze while
 some other chat was mid-generation. See CLAUDE.md's "Rule #1" for why
 that distinction is treated as a hard rule, not a nice-to-have.
 
+## Wire format
+
+**Message submission** (`POST /api/conversations/{id}/messages`) is a
+multipart form with the user's question text and any newly staged files.
+The backend streams a single SSE response carrying both ingestion progress
+and the answer:
+
+```
+event: document_status
+data: {"document_id":"d1","filename":"report.pdf","status":"extracting"}
+
+event: document_status
+data: {"document_id":"d1","filename":"report.pdf","status":"indexed"}
+
+event: message_status
+data: {"status":"retrieving"}
+
+event: token
+data: {"token":"The"}
+
+event: token
+data: {"token":" report"}
+
+event: citations
+data: {"citations":[{"chunk_id":"c3","document_id":"d1","document_filename":"report.pdf","source_ref":{"kind":"page","page":4},"snippet":"Revenue grew 12% YoY..."}]}
+
+event: done
+data: {}
+```
+
+**Reconnect** (`GET /api/conversations/{id}/messages/{message_id}/stream`)
+is the route a refreshed page calls to reattach to an in-progress (or
+already-finished) generation — same SSE event stream, replaying completed
+tokens and then going live.
+
+**Core models** — every shared shape lives in `src/models.py` as Pydantic
+v2 models, the single source of truth for both the wire format and the
+database:
+
+```python
+class SourceRef(PageRef | TimeRef):  # discriminated on `kind`
+    """The detail that makes citations growable to audio/video later.
+    Adding a real audio/video ingestor only ever produces a new TimeRef
+    variant — it never requires touching Chunk, Citation, or anything
+    downstream."""
+
+class Chunk(BaseModel):
+    id: str
+    document_id: str
+    conversation_id: str
+    text: str
+    source_ref: SourceRef
+    chunk_index: int
+
+class Citation(BaseModel):
+    chunk_id: str
+    document_id: str
+    document_filename: str
+    source_ref: SourceRef
+    snippet: str
+
+class Message(BaseModel):
+    id: str
+    conversation_id: str
+    role: Literal["system", "user", "assistant"]
+    content: str
+    citations: list[Citation]
+    status: MessageStatus  # queued → processing-documents → retrieving → generating → done | error
+    created_at: datetime
+```
+
 ## Proving "air-gapped," not just claiming it
 
 Every test in the suite runs under `pytest-socket`
@@ -284,8 +386,13 @@ lives in Rust — the boundary is purely process management.
   would be a much higher barrier to entry for non-developers.
 - `backend_main.py` is the PyInstaller entry point — it resolves the web
   directory path differently depending on whether it's running frozen
-  (`sys._MEIPASS`) or from source, and defaults to mock drivers in frozen
-  mode so the app works out of the box with nothing extra installed.
+  (`sys._MEIPASS`) or from source, and sets `KEEPR_FROZEN=1`. `config.py`'s
+  `_default_driver` reads that to make the frozen path always resolve to the
+  real `llama_cpp` driver/embedder, even with no model downloaded yet —
+  never mock. An end user with nothing installed must see the app's real
+  "no model installed" refusal, not a silent, meaningless answer from a mock
+  driver — mock is a dev/test convenience, not something a real user should
+  ever hit unknowingly.
 
 ## What's deliberately not built yet
 
@@ -327,3 +434,23 @@ Being explicit about scope, not just implicit through omission:
   uncorrected for a while (see the **Model** row above) — a real eval set,
   run across candidate models, would make that kind of claim measured
   instead of asserted.
+
+## Design principles
+
+The choices above all trace back to the same five rules:
+
+1. **Own your stack.** Every line of the retrieval/indexing/inference
+   pipeline is in this repo — no black-box services, no "just configure
+   this flag."
+2. **Determinism over prompting for safety guarantees.** The headline
+   "doesn't hallucinate" claim rests on a float comparison and a
+   set-membership check, not on trusting a model's judgment.
+3. **Interfaces before implementations.** Every layer boundary is a
+   protocol/ABC. Adding a new backend means implementing an interface
+   that already exists.
+4. **Personal scale is not a shortcut — it's the correct design point.**
+   Brute-force exact search, single-process concurrency, and SQLite are
+   the right choices at this scale, not compromises.
+5. **Air-gapped is proven, not claimed.** The test suite blocks all
+   network access — any code path that opens a socket fails the entire
+   suite.
