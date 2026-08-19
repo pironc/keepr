@@ -4,10 +4,11 @@ When running as a frozen bundle (``sys.frozen``), the web directory lives
 inside ``sys._MEIPASS``; when running from source the web directory is
 resolved relative to this file.
 
-In the frozen (production) path we default to mock drivers so the app
-works out of the box with nothing extra installed.  Users who want real
-local models set the usual env vars (``LLM_DRIVER``, ``EMBEDDER``, etc.)
-before launching.
+``KEEPR_FROZEN`` (read by ``src/config.py``'s ``_default_driver``) makes the
+frozen path always default to the real ``llama_cpp`` driver/embedder, never
+mock — an end user with no model downloaded yet must see the app's real
+"no model installed" refusal, not a meaningless mock-generated answer. An
+explicit ``LLM_DRIVER``/``EMBEDDER`` env var still overrides this.
 """
 
 from __future__ import annotations

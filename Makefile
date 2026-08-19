@@ -13,7 +13,7 @@ endif
 
 install:
 	@test -d .venv || python3 -m venv .venv
-	$(PIP) install -e ".[dev]"
+	$(PIP) install -e ".[dev,llama]"
 
 run:
 	$(VENV)/uvicorn src.api.app:app --reload --reload-dir src --reload-dir src/web --port 8000
@@ -110,6 +110,8 @@ build-backend:
 		--add-data "src/web:src/web" \
 		--hidden-import pypdf \
 		--hidden-import aiosqlite \
+		--hidden-import huggingface_hub \
+		--collect-all llama_cpp \
 		backend_main.py
 	mkdir -p src-tauri/binaries
 	cp dist/keepr-backend src-tauri/binaries/keepr-backend-$(TARGET_TRIPLE)

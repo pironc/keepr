@@ -79,18 +79,21 @@ class LlamaCppEmbedder:
                 "Download it in Settings → Models, or copy a .gguf file into it.",
                 role=ModelRole.EMBEDDING,
             )
-        from llama_cpp import Llama  # lazy: only needed once a real file is actually being loaded
-
         logger.info("llama_cpp: loading embedder %s …", self._model_path.name)
         try:
+            from llama_cpp import (
+                Llama,  # lazy: only needed once a real file is actually being loaded
+            )
+
             self._model = Llama(
                 model_path=str(self._model_path), embedding=True,
                 n_gpu_layers=self._n_gpu_layers, verbose=False,
             )
-        except Exception as exc:  # corrupt/truncated/wrong-gauge load failures
+        except Exception as exc:  # missing package, corrupt/truncated/wrong-gauge load failures
             raise ModelUnavailableError(
                 f"{_LOAD_MSG_LEAD}: {self._model_path.name}. "
-                "Try re-downloading the model.",
+                "Try re-downloading the model, or reinstalling with "
+                "`pip install -e \".[llama]\"` if the llama_cpp package itself is missing.",
                 role=ModelRole.EMBEDDING,
             ) from exc
         logger.info("llama_cpp: embedder loaded")

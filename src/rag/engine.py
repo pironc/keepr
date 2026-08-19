@@ -53,35 +53,14 @@ _CITATION_PATTERN = re.compile(r"\[(chunk_\d+)\]")
 _TAG_PATTERN = re.compile(r"\[chunk_\d+\]")
 
 
-def _embedder_unavailable_text() -> str:
-    """User-facing text when the embedding model is unavailable but the
-    language model (checked elsewhere) is fine.  Kept concise — the per-file
-    reason lives in the message's ``error_message``, not in the chat text."""
-    return (
-        "I couldn't look up an answer because no embedding model is installed. "
-        "Download one in Settings → Models."
-    )
-
-
 def _both_models_unavailable_text() -> str:
-    """User-facing text when neither an embedding nor a language model is
-    installed.  Kept short on purpose: the user asked for just a statement that
-    nothing is downloaded, not the per-file reasons (those live in the
-    ``error_message`` for diagnostics)."""
+    """User-facing text when neither an embedding nor a language model file
+    exists on disk at all — the upfront, cheap availability gate below is the
+    only caller, so this is only ever accurate for a genuine "nothing
+    downloaded yet" state, never a present-but-broken file."""
     return (
         "I couldn't look up an answer — neither an embedding model "
         "nor a language model is downloaded. Get them in Settings → Models."
-    )
-
-
-def _language_model_unavailable_text() -> str:
-    """User-facing text when retrieval succeeded but the language model is
-    unavailable — the current chat's documents were still read, it just couldn't
-    generate an answer.  Kept concise — the per-file reason lives in the
-    message's ``error_message``, not in the chat text."""
-    return (
-        "I couldn't generate an answer because no language model is installed. "
-        "Download one in Settings → Models."
     )
 
 
@@ -189,18 +168,15 @@ class RagEngine:
             # a real embedder.
             if message_id is None:
                 raise
-            # Retrieval failed before the LLM was ever reached, so this call
-            # alone can't see the language model's state.  Probe it cheaply
-            # (no model load) so a user who has *neither* model installed gets
-            # both named rather than a misleading "only the embedder is
-            # missing".  (The upfront both-missing gate below usually catches
-            # this case first — this is the fallback for when the embedder's
-            # FILE exists but fails to *load* (e.g. corrupt), making the
-            # cheap upfront probe miss it.)
+            # exc's own message is already specific and actionable — it
+            # distinguishes "file not found" from "file exists but failed to
+            # load" (corrupt/wrong-arch/missing llama_cpp package), which a
+            # generic "not installed" string can't.  Retrieval failed before
+            # the LLM was ever reached, so also probe it cheaply (no model
+            # load) so a user missing *both* models gets both named rather
+            # than only the embedder.
             llm_reason = await driver.availability()
-            body = _embedder_unavailable_text()
-            if llm_reason is not None:
-                body = _both_models_unavailable_text()
+            body = str(exc) if llm_reason is None else f"{exc} {llm_reason}"
             message = await self._finalize(
                 conversation_id,
                 body,
@@ -273,16 +249,16 @@ class RagEngine:
                 if clean:
                     yield TokenEvent(text=clean)
         except ModelUnavailableError as exc:
-            # The selected language model is missing on disk or failed to load
-            # (corrupt/truncated/wrong architecture). Retrieval already
-            # succeeded, so only the language model can be at fault here — say
-            # so plainly and surface the underlying reason.  Direct-call tests
+            # exc's own message already distinguishes "missing on disk" from
+            # "failed to load" (corrupt/truncated/wrong architecture/missing
+            # llama_cpp package). Retrieval already succeeded, so only the
+            # language model can be at fault here.  Direct-call tests
             # (message_id None) propagate exactly as before.
             if message_id is None:
                 raise
             message = await self._finalize(
                 conversation_id,
-                _language_model_unavailable_text(),
+                str(exc),
                 [],
                 message_id=message_id,
                 status=MessageStatus.ERROR,

@@ -10,6 +10,7 @@ one-line addition, not a rewrite.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import platform
@@ -113,11 +114,27 @@ def _resolve_model_path(
 
 
 def _default_driver(model_path: Path) -> str:
-    """Driver to use when LLM_DRIVER/EMBEDDER isn't set explicitly: real
-    inference if a model file is actually there (e.g. downloaded/selected
-    via Settings — the packaged desktop app has no shell to set an env var
-    in), mock otherwise (a fresh checkout with nothing downloaded yet)."""
-    return "llama_cpp" if model_path.is_file() else "mock"
+    """Driver to use when LLM_DRIVER/EMBEDDER isn't set explicitly.
+
+    Packaged app (`KEEPR_FROZEN` set by backend_main.py when running from the
+    PyInstaller bundle — see src/api/app.py's matching check): always
+    `llama_cpp`, even with no model downloaded yet or a package/load failure.
+    An end user must see the real "no model installed" refusal
+    (RagEngine.answer's availability gate / ModelUnavailableError) instead of
+    silently getting a meaningless answer from the mock driver — mock is a
+    dev/test convenience, never something a real user should hit unknowingly.
+
+    Dev/CI (KEEPR_FROZEN unset): real inference only if a model file is
+    actually there AND the optional `llama_cpp` package is actually
+    importable (a dev venv from a plain `make install` doesn't have it — a
+    `models/` directory left over from an earlier, differently-installed venv
+    shouldn't crash the app trying to import a package that isn't there).
+    Mock otherwise, for a friction-free default on a fresh checkout."""
+    if os.environ.get("KEEPR_FROZEN"):
+        return "llama_cpp"
+    if not model_path.is_file():
+        return "mock"
+    return "llama_cpp" if importlib.util.find_spec("llama_cpp") is not None else "mock"
 
 
 @dataclass(slots=True)

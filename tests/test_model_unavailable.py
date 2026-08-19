@@ -9,7 +9,11 @@ checks the file exists before its lazy `from llama_cpp import Llama`, so that
 branch raises before the import is ever reached. The corrupt-file branch does
 need a `llama_cpp.Llama` to patch — `fake_llama_cpp_module` below injects a
 throwaway module into `sys.modules` for the test's duration so that works
-whether or not the real package is present.
+whether or not the real package is present. The missing-*package* branch
+(file present, but `llama_cpp` itself isn't installed — the actual scenario
+this dev venv is normally in) needs `from llama_cpp import Llama` itself to
+be inside the same try/except as the constructor call, not merely before it;
+`missing_llama_cpp_package` forces that specific import to raise.
 """
 
 from __future__ import annotations
@@ -59,6 +63,17 @@ def fake_llama_cpp_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     return fake
 
 
+@pytest.fixture
+def missing_llama_cpp_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulates the llama_cpp package genuinely not being installed — the
+    real scenario this venv is normally in — distinct from
+    `fake_llama_cpp_module` above, which simulates it being installed but
+    broken. Setting `sys.modules[name] = None` forces the next `import name`
+    to raise `ModuleNotFoundError`, regardless of whether the real package
+    happens to be present in whatever environment runs this test."""
+    monkeypatch.setitem(sys.modules, "llama_cpp", None)
+
+
 def test_driver_missing_file_raises_model_unavailable(missing_path: Path) -> None:
     driver = LlamaCppDriver(missing_path, n_ctx=2048, n_gpu_layers=0)
     with pytest.raises(ModelUnavailableError, match="Language model file not found"):
@@ -90,6 +105,30 @@ def test_embedder_corrupt_file_wraps_load_error_as_model_unavailable(
         embedder._load()
     assert "could not be loaded" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_driver_missing_package_raises_model_unavailable(
+    corrupt_path: Path, missing_llama_cpp_package: None
+) -> None:
+    """Regression test: `from llama_cpp import Llama` must be inside the
+    same try/except as the constructor call, not just before it — otherwise
+    a genuinely-missing package (as opposed to a present-but-broken one)
+    raises a raw ModuleNotFoundError instead of ModelUnavailableError."""
+    driver = LlamaCppDriver(corrupt_path, n_ctx=2048, n_gpu_layers=0)
+    with pytest.raises(ModelUnavailableError) as excinfo:
+        driver._load()
+    assert "could not be loaded" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
+
+
+def test_embedder_missing_package_raises_model_unavailable(
+    corrupt_path: Path, missing_llama_cpp_package: None
+) -> None:
+    embedder = LlamaCppEmbedder(corrupt_path, n_gpu_layers=0)
+    with pytest.raises(ModelUnavailableError) as excinfo:
+        embedder._load()
+    assert "could not be loaded" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
 
 
 def test_driver_carry_role_language() -> None:

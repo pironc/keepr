@@ -117,6 +117,21 @@ const MESSAGE_STATUS_LABELS = {
   retrieving: "Retrieving…",
 };
 
+// Shown in place of the bubble content when a message ends in "error" with
+// nothing else saved — an unhandled crash before any real answer text (or
+// partial streamed tokens) existed to preserve. Without this, the bubble
+// renders as genuinely empty with only the red "Error" status label above
+// it, reading as the UI itself being broken rather than the generation
+// having failed. A message that *does* have partial content (interrupted
+// mid-stream, or a handled error like a missing model with its own
+// explanatory text) keeps that real content instead — this only fills the
+// gap when there's truly nothing else to show.
+const GENERATION_ERROR_FALLBACK = "Something went wrong while generating this response. Please try asking again.";
+
+function _displayContentFor(status, content) {
+  return status === "error" && !content ? GENERATION_ERROR_FALLBACK : content;
+}
+
 // Rotated through while the status is "generating" — a new word every
 // ~3.5 seconds so it reads as a natural, unhurried cadence.
 const GENERATING_PHRASES = [
@@ -884,16 +899,15 @@ function renderMessage(role, content, citations, status = "done", messageId = nu
   } else {
     // Assistant bubble — hide it when there's nothing to show yet (queued /
     // retrieving / generating) so the status text doesn't sit on top of a
-    // visible empty beige box. Also hide it on error when the backend left
-    // no partial content — otherwise "Error" renders with a hollow bubble
-    // underneath. Error paths that *do* have partial content (or that
-    // substitute a message like "Something went wrong") reveal the box
-    // explicitly, so this default stays hidden until then.
+    // visible empty beige box. An error with no partial content gets the
+    // GENERATION_ERROR_FALLBACK text substituted in (see _displayContentFor),
+    // so it's never actually empty and this stays revealed for that case.
     const bubble = document.createElement("div");
     bubble.className = "message assistant";
-    renderMessageContent(contentEl, content, groups);
+    const displayContent = _displayContentFor(status, content);
+    renderMessageContent(contentEl, displayContent, groups);
     bubble.appendChild(contentEl);
-    if (!content && status !== "done") {
+    if (!displayContent && status !== "done") {
       bubble.style.display = "none";
     }
     wrapper.appendChild(bubble);
@@ -1710,7 +1724,11 @@ function handleMessageEvent(bubble, parsed, citationsRef) {
     if (msgBubble && msgBubble.style.display === "none") {
       msgBubble.style.display = "";
     }
-    renderMessageContent(bubble.querySelector(".bubble-content"), parsed.data.content, citationsRef.groups);
+    renderMessageContent(
+      bubble.querySelector(".bubble-content"),
+      _displayContentFor(parsed.data.status, parsed.data.content),
+      citationsRef.groups
+    );
     setMessageStatus(bubble, parsed.data.status);
     scrollMessagesToBottom();
     // Re-fetch the conversation list so the just-finished conversation

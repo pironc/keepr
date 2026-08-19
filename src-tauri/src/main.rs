@@ -22,14 +22,28 @@ unsafe extern "system" {
 
 struct BackendProcess(Mutex<Option<Child>>);
 
+/// Kill and reap the backend child if one is still tracked. Shared by every
+/// place that might be the one to actually notice the app is exiting — no
+/// single one of them is reliably first on every platform/quit path, so this
+/// runs from three: `RunEvent::Exit` (the authoritative "event loop is
+/// exiting" signal, covers Cmd+Q and any other full-app-termination path),
+/// the main window's own `Destroyed` event (a window can go away slightly
+/// ahead of the full app-exit event on some platforms), and `Drop` (a final
+/// backstop if the state value itself is dropped some other way). Calling it
+/// more than once is harmless: `guard.take()` leaves nothing for the next
+/// caller to act on.
+fn kill_backend_process(process: &BackendProcess) {
+    if let Ok(mut guard) = process.0.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl Drop for BackendProcess {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.0.lock() {
-            if let Some(ref mut child) = *guard {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        kill_backend_process(self);
     }
 }
 
@@ -245,16 +259,17 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(state) = window.try_state::<BackendProcess>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(ref mut child) = *guard {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        *guard = None;
-                    }
+                    kill_backend_process(&state);
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running keepr");
+        .build(tauri::generate_context!())
+        .expect("error while building keepr")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<BackendProcess>() {
+                    kill_backend_process(&state);
+                }
+            }
+        });
 }

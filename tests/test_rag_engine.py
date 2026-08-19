@@ -676,10 +676,11 @@ async def test_only_embedding_model_missing_message_is_scoped(
     assert isinstance(events[-1], DoneEvent)
     assert events[-1].message.status == MessageStatus.ERROR
     text = events[-1].message.content
-    assert "embedding model" in text
-    assert "no embedding model is installed" in text
+    # The chat text is now the embedder's own specific reason, not a generic
+    # "not installed" string — accurate whether the file is missing or the
+    # load itself failed.
+    assert "Embedding model file not found" in text
     assert "language model" not in text  # the LLM is fine — don't blame it
-    # The per-file reason is preserved for diagnostics, not in the chat text.
     assert "Embedding model file not found" in (events[-1].message.error_message or "")
 
 
@@ -711,8 +712,9 @@ async def test_only_language_model_missing_message_is_scoped(
     assert isinstance(events[-1], DoneEvent)
     assert events[-1].message.status == MessageStatus.ERROR
     text = events[-1].message.content
-    assert "language model" in text
-    assert "no language model is installed" in text
+    # The chat text is now the driver's own specific load-failure reason, not
+    # a generic "not installed" string — that would be actively wrong here
+    # since the file exists and only the load failed.
+    assert "could not be loaded" in text
     assert "embedding model" not in text  # retrieval worked — don't blame the embedder
-    # The load/corruption reason is preserved for diagnostics, not in the chat text.
     assert "could not be loaded" in (events[-1].message.error_message or "")

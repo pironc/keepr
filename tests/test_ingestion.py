@@ -68,6 +68,22 @@ def test_registry_picks_text_ingestor_for_txt() -> None:
     assert isinstance(find_ingestor("notes.txt", "text/plain"), TextIngestor)
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ["data.json", "table.csv", "config.yaml", "app.log", "notes.rst", "main.py", "index.html"],
+)
+def test_registry_picks_text_ingestor_for_broadened_extensions(filename: str) -> None:
+    # "application/octet-stream" matches what process_existing() actually
+    # calls find_ingestor with (see text_ingestor.py's module docstring) —
+    # so a real browser mime type must never be required for these to match.
+    assert isinstance(find_ingestor(filename, "application/octet-stream"), TextIngestor)
+
+
+def test_registry_still_returns_none_for_genuinely_unsupported_types() -> None:
+    assert find_ingestor("archive.zip", "application/octet-stream") is None
+    assert find_ingestor("photo.png", "application/octet-stream") is None
+
+
 def test_registry_picks_pdf_ingestor_for_pdf() -> None:
     assert isinstance(find_ingestor("report.pdf", "application/pdf"), PdfIngestor)
 
