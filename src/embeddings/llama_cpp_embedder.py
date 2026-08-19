@@ -73,14 +73,14 @@ class LlamaCppEmbedder:
         never a raw llama-cpp exception — so the ingestion pipeline and RAG
         engine can turn it into a readable, actionable error instead of
         crashing the SSE stream."""
-        from llama_cpp import Llama  # lazy: only needed when this embedder is actually selected
-
         if not self._model_path.is_file():
             raise ModelUnavailableError(
                 f"{_MISSING_MSG_LEAD}: {self._model_path}. "
                 "Download it in Settings → Models, or copy a .gguf file into it.",
                 role=ModelRole.EMBEDDING,
             )
+        from llama_cpp import Llama  # lazy: only needed once a real file is actually being loaded
+
         logger.info("llama_cpp: loading embedder %s …", self._model_path.name)
         try:
             self._model = Llama(

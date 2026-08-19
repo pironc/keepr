@@ -2,15 +2,20 @@
 as a :class:`ModelUnavailableError` from both the llama.cpp LLM driver and the
 embedder — never a raw llama-cpp exception leaking out of `_load()`.
 
-The lazy import inside `_load()` (`from llama_cpp import Llama`) is patched here
-so no real GGUF file is needed. The missing-file branch is exercised without
-touching llama_cpp at all (it's a filesystem check); the corrupt-file branch
-patches the constructor to raise (as llama.cpp does on a truncated/wrong-gauge
-model).
+llama-cpp-python is an optional, heavier extra (`.[llama]`) not installed in
+the default dev/CI environment, so none of this may depend on it actually
+being importable. The missing-file branch never needs it at all: `_load()`
+checks the file exists before its lazy `from llama_cpp import Llama`, so that
+branch raises before the import is ever reached. The corrupt-file branch does
+need a `llama_cpp.Llama` to patch — `fake_llama_cpp_module` below injects a
+throwaway module into `sys.modules` for the test's duration so that works
+whether or not the real package is present.
 """
 
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -43,6 +48,17 @@ def corrupt_path(tmp_path: Path) -> Path:
     return p
 
 
+@pytest.fixture
+def fake_llama_cpp_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """Stand in for the real `llama_cpp` package for the test's duration, so
+    `from llama_cpp import Llama` inside `_load()` resolves to `_Boom`
+    regardless of whether llama-cpp-python is actually installed."""
+    fake = types.ModuleType("llama_cpp")
+    fake.Llama = _Boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "llama_cpp", fake)
+    return fake
+
+
 def test_driver_missing_file_raises_model_unavailable(missing_path: Path) -> None:
     driver = LlamaCppDriver(missing_path, n_ctx=2048, n_gpu_layers=0)
     with pytest.raises(ModelUnavailableError, match="Language model file not found"):
@@ -56,9 +72,8 @@ def test_embedder_missing_file_raises_model_unavailable(missing_path: Path) -> N
 
 
 def test_driver_corrupt_file_wraps_load_error_as_model_unavailable(
-    corrupt_path: Path, monkeypatch: pytest.MonkeyPatch
+    corrupt_path: Path, fake_llama_cpp_module: types.ModuleType
 ) -> None:
-    monkeypatch.setattr("llama_cpp.Llama", _Boom)
     driver = LlamaCppDriver(corrupt_path, n_ctx=2048, n_gpu_layers=0)
     with pytest.raises(ModelUnavailableError) as excinfo:
         driver._load()
@@ -68,9 +83,8 @@ def test_driver_corrupt_file_wraps_load_error_as_model_unavailable(
 
 
 def test_embedder_corrupt_file_wraps_load_error_as_model_unavailable(
-    corrupt_path: Path, monkeypatch: pytest.MonkeyPatch
+    corrupt_path: Path, fake_llama_cpp_module: types.ModuleType
 ) -> None:
-    monkeypatch.setattr("llama_cpp.Llama", _Boom)
     embedder = LlamaCppEmbedder(corrupt_path, n_gpu_layers=0)
     with pytest.raises(ModelUnavailableError) as excinfo:
         embedder._load()

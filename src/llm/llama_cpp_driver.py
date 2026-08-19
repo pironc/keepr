@@ -52,14 +52,14 @@ class LlamaCppDriver(LLMDriver):
         architecture, OOM) is surfaced as a :class:`ModelUnavailableError` —
         never a raw llama-cpp exception — so callers can turn it into a
         readable, actionable error rather than an opaque worker failure."""
-        from llama_cpp import Llama  # lazy: only needed when this driver is actually selected
-
         if not self._model_path.is_file():
             raise ModelUnavailableError(
                 f"{_MISSING_MSG_LEAD}: {self._model_path}. "
                 "Download it in Settings → Models, or copy a .gguf file into it.",
                 role=ModelRole.LANGUAGE,
             )
+        from llama_cpp import Llama  # lazy: only needed once a real file is actually being loaded
+
         logger.info("llama_cpp: loading LLM %s (n_ctx=%d, n_gpu_layers=%d) …",
                      self._model_path.name, self._n_ctx, self._n_gpu_layers)
         try:
