@@ -23,10 +23,10 @@
 
 <p align="center"><em>Downloads</em></p>
 <p align="center">
-  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-aarch64.dmg" style="display:inline-flex; align-items:center; gap:6px; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;"><img src="../assets/icons/apple.svg" width="12" height="12" style="display:block;" alt="">OSX&#160;ARM</a>
-  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-x86_64.dmg" style="display:inline-flex; align-items:center; gap:6px; background-color:#FF6600; color:#ffffff; padding:5px 14px; border-radius:999px; font-weight:600; text-decoration:none; font-size:12px; margin:2px 3px;"><img src="../assets/icons/apple.svg" width="12" height="12" style="display:block;" alt="">OSX&#160;x86</a>
-  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-linux-x86_64.AppImage" title="Linux" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/linux.svg" width="15" height="15" style="display:block;" alt="Linux"></a>
-  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-windows-x86_64-setup.exe" title="Windows" style="display:inline-block; background-color:#FF6600; border-radius:999px; padding:5px; margin:2px 3px; line-height:0;"><img src="../assets/icons/windows.svg" width="15" height="15" style="display:block;" alt="Windows"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-aarch64.dmg"><img src="https://img.shields.io/badge/OSX_ARM-FF6600?logo=apple&logoColor=white" alt="macOS Apple Silicon"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-mac-x86_64.dmg"><img src="https://img.shields.io/badge/OSX_x86-FF6600?logo=apple&logoColor=white" alt="macOS Intel"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-linux-x86_64.AppImage"><img src="https://img.shields.io/badge/Linux-FF6600?logo=linux&logoColor=white" alt="Linux"></a>
+  <a href="https://github.com/pironc/keepr/releases/latest/download/keepr-windows-x86_64-setup.exe"><img src="https://img.shields.io/badge/Windows-FF6600?logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA4OCA4OCIgZmlsbD0iI2ZmZmZmZiI+CiAgPHBhdGggZD0iTTAgMTIuNDAybDM1LjY4Ny00Ljg2LjAxNiAzNC40MjMtMzUuNjcuMjAzeiIvPgogIDxwYXRoIGQ9Ik0zNS42NyA0NS45MzFsLjAyOCAzNC40NTNMLjAyOCA3NS40OC4wMjYgNDUuN3oiLz4KICA8cGF0aCBkPSJNNDAuMDAyIDcuMzc3TDg3LjMxNCAwdjQxLjUyN2wtNDcuMzE4LjM3NnoiLz4KICA8cGF0aCBkPSJNODcuMzMxIDQ1LjkwNmwtLjAxMSA0MS4zNC00Ny4zMTgtNi42NzgtLjA2Ni0zNC43Mzl6Ii8+Cjwvc3ZnPgo=" alt="Windows"></a>
 </p>
 
 # keepr

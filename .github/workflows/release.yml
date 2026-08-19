@@ -65,6 +65,11 @@ jobs:
 
       - name: Install Linux system dependencies (Tauri)
         if: matrix.os == 'linux'
+        env:
+          # needrestart's interactive "restart services?" prompt has no TTY
+          # to answer in CI, hanging apt-get install indefinitely otherwise.
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
           sudo apt-get update
           sudo apt-get install -y \
