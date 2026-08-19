@@ -274,11 +274,11 @@ Copiez `.env.example` vers `.env` pour personnaliser. L'essentiel :
 
 | Variable | Rôle |
 |---|---|
-| `LLM_DRIVER` | `mock` (défaut, zéro téléchargement) ou `llama_cpp` (véritable inférence locale GGUF). |
+| `LLM_DRIVER` | `mock` ou `llama_cpp`. Laissez non défini pour une détection automatique : `llama_cpp` dès qu'un vrai GGUF est présent (téléchargé/sélectionné dans Réglages), `mock` sinon — zéro téléchargement sur une installation neuve, aucune variable nécessaire une fois qu'un modèle existe. |
 | `LLM_MODEL_PATH` | Chemin vers le fichier GGUF. Uniquement lorsque `LLM_DRIVER=llama_cpp`. Laissez vide pour utiliser le modèle choisi dans le menu Réglages. |
 | `LLM_CONTEXT_WINDOW` | Taille de la fenêtre de contexte (par défaut auto-détectée depuis `MEMORY_TIER`, généralement `8192`). |
 | `LLM_GPU_LAYERS` | Couches à déléguer au GPU (`-1` = toutes, par défaut). |
-| `EMBEDDER` | `mock` (défaut) ou `llama_cpp`. |
+| `EMBEDDER` | `mock` ou `llama_cpp`. Même détection automatique que `LLM_DRIVER`, évaluée indépendamment. |
 | `EMBEDDING_MODEL_PATH` | Chemin vers le modèle GGUF de vectorisation. Uniquement lorsque `EMBEDDER=llama_cpp`. Laissez vide pour utiliser le modèle choisi dans le menu Réglages. |
 | `EMBEDDING_GPU_LAYERS` | Couches GPU pour la vectorisation (par défaut `0` — la vectorisation s'exécute sur CPU pour éviter la contention GPU avec le LLM). |
 | `VECTOR_INDEX_BACKEND` | `flat` (float32, exact) ou `quantized` (quantification scalaire int8, ~4× moins de mémoire). |

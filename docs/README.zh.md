@@ -273,11 +273,11 @@ make run
 
 | 变量 | 用途 |
 |---|---|
-| `LLM_DRIVER` | `mock`（默认，零下载）或 `llama_cpp`（真实本地 GGUF 推理）。 |
+| `LLM_DRIVER` | `mock` 或 `llama_cpp`。留空则自动检测：一旦真的存在 GGUF 文件（例如在设置中下载/选择过）就使用 `llama_cpp`，否则使用 `mock`——全新安装时零下载，一旦模型存在就无需设置该变量。 |
 | `LLM_MODEL_PATH` | GGUF 文件路径。仅当 `LLM_DRIVER=llama_cpp` 时使用。留空则使用“设置”菜单中选定的模型。 |
 | `LLM_CONTEXT_WINDOW` | 上下文窗口大小（默认根据 `MEMORY_TIER` 自动检测，通常为 `8192`）。 |
 | `LLM_GPU_LAYERS` | 卸载到 GPU 的层数（`-1` = 全部，默认）。 |
-| `EMBEDDER` | `mock`（默认）或 `llama_cpp`。 |
+| `EMBEDDER` | `mock` 或 `llama_cpp`。与 `LLM_DRIVER` 相同的自动检测逻辑，二者独立判断。 |
 | `EMBEDDING_MODEL_PATH` | GGUF 嵌入模型路径。仅当 `EMBEDDER=llama_cpp` 时使用。留空则使用“设置”菜单中选定的模型。 |
 | `EMBEDDING_GPU_LAYERS` | 嵌入 GPU 层数（默认 `0`——嵌入在 CPU 上运行，以避免与 LLM 争抢 GPU）。 |
 | `VECTOR_INDEX_BACKEND` | `flat`（float32，精确）或 `quantized`（int8 标量量化，约 4 倍内存节省）。 |

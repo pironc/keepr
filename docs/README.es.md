@@ -274,11 +274,11 @@ Copia `.env.example` a `.env` para personalizarlas. Las esenciales:
 
 | Variable | Propósito |
 |---|---|
-| `LLM_DRIVER` | `mock` (por defecto, sin descarga) o `llama_cpp` (inferencia GGUF local real). |
+| `LLM_DRIVER` | `mock` o `llama_cpp`. Déjalo sin definir para autodetectar: `llama_cpp` en cuanto exista realmente un GGUF (p. ej. descargado/seleccionado en Ajustes), `mock` en caso contrario — sin descargas en una instalación nueva, sin necesitar la variable una vez que existe un modelo. |
 | `LLM_MODEL_PATH` | Ruta al archivo GGUF. Solo cuando `LLM_DRIVER=llama_cpp`. Déjalo sin configurar para usar el modelo elegido en el menú de Ajustes. |
 | `LLM_CONTEXT_WINDOW` | Tamaño de la ventana de contexto (por defecto se detecta automáticamente desde `MEMORY_TIER`, típicamente `8192`). |
 | `LLM_GPU_LAYERS` | Capas a descargar en la GPU (`-1` = todas, por defecto). |
-| `EMBEDDER` | `mock` (por defecto) o `llama_cpp`. |
+| `EMBEDDER` | `mock` o `llama_cpp`. Misma autodetección que `LLM_DRIVER`, evaluada de forma independiente. |
 | `EMBEDDING_MODEL_PATH` | Ruta al modelo GGUF de incrustación. Solo cuando `EMBEDDER=llama_cpp`. Déjalo sin configurar para usar el modelo elegido en el menú de Ajustes. |
 | `EMBEDDING_GPU_LAYERS` | Capas de GPU para incrustación (por defecto `0` — la incrustación se ejecuta en CPU para evitar contención de GPU con el LLM). |
 | `VECTOR_INDEX_BACKEND` | `flat` (float32, exacto) o `quantized` (cuantización escalar int8, ~4× menos memoria). |

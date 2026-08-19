@@ -112,6 +112,14 @@ def _resolve_model_path(
     return models_dir / default_filename
 
 
+def _default_driver(model_path: Path) -> str:
+    """Driver to use when LLM_DRIVER/EMBEDDER isn't set explicitly: real
+    inference if a model file is actually there (e.g. downloaded/selected
+    via Settings — the packaged desktop app has no shell to set an env var
+    in), mock otherwise (a fresh checkout with nothing downloaded yet)."""
+    return "llama_cpp" if model_path.is_file() else "mock"
+
+
 @dataclass(slots=True)
 class Settings:
     backend: Backend
@@ -159,24 +167,27 @@ class Settings:
         )
         selection = load_model_selection(selection_path)
 
+        llm_model_path = _resolve_model_path(
+            os.environ.get("LLM_MODEL_PATH"), selection.get("llm"), DEFAULT_LLM_MODEL, models_dir
+        )
+        embedding_model_path = _resolve_model_path(
+            os.environ.get("EMBEDDING_MODEL_PATH"),
+            selection.get("embedding"),
+            DEFAULT_EMBEDDING_MODEL,
+            models_dir,
+        )
+
         return cls(
             backend=backend,
             memory_tier=tier,
             models_dir=models_dir,
             model_selection_path=selection_path,
-            llm_driver=os.environ.get("LLM_DRIVER", "mock"),
-            llm_model_path=_resolve_model_path(
-                os.environ.get("LLM_MODEL_PATH"), selection.get("llm"), DEFAULT_LLM_MODEL, models_dir
-            ),
+            llm_driver=os.environ.get("LLM_DRIVER", "").strip() or _default_driver(llm_model_path),
+            llm_model_path=llm_model_path,
             llm_context_window=int(os.environ.get("LLM_CONTEXT_WINDOW", str(tier.context_window))),
             llm_gpu_layers=int(os.environ.get("LLM_GPU_LAYERS", "-1")),
-            embedder=os.environ.get("EMBEDDER", "mock"),
-            embedding_model_path=_resolve_model_path(
-                os.environ.get("EMBEDDING_MODEL_PATH"),
-                selection.get("embedding"),
-                DEFAULT_EMBEDDING_MODEL,
-                models_dir,
-            ),
+            embedder=os.environ.get("EMBEDDER", "").strip() or _default_driver(embedding_model_path),
+            embedding_model_path=embedding_model_path,
             embedding_gpu_layers=int(os.environ.get("EMBEDDING_GPU_LAYERS", "0")),
             vector_index_backend=os.environ.get("VECTOR_INDEX_BACKEND", "flat"),
             retrieval_top_k=int(os.environ.get("RETRIEVAL_TOP_K", "5")),

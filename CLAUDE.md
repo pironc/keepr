@@ -27,9 +27,14 @@ connection open, that's a bug, not a UI detail to work around.
 
 keepr is a privacy-first, local-first RAG chat app: drop in documents,
 ask questions, get answers grounded only in what was uploaded, with
-citations, entirely offline-capable. `LLM_DRIVER=mock` /
-`EMBEDDER=mock` (the defaults) need zero model downloads; `llama_cpp`
-drivers give real local inference via GGUF models.
+citations, entirely offline-capable. `LLM_DRIVER`/`EMBEDDER` default to
+`llama_cpp` the moment a real GGUF is actually present at the resolved
+model path (env var > Settings-menu selection > default filename) and to
+`mock` otherwise (`src/config.py`'s `_default_driver`) — mock needs zero
+model downloads for a fresh checkout, and the packaged desktop app has no
+shell to set an env var in, so a model downloaded/selected via Settings
+just works with no separate driver toggle. An explicit `LLM_DRIVER`/
+`EMBEDDER` env var always overrides this auto-detection either way.
 
 "Offline-capable" describes what a user can choose, not a constraint the
 app enforces on itself: `huggingface_hub` is a base dependency (not an
@@ -59,6 +64,13 @@ make clean                # wipes DB/index/uploads (app state) — NOT model wei
 #   .../releases/latest/download/keepr-mac-{aarch64,x86_64}.dmg
 #   .../releases/latest/download/keepr-windows-x86_64{-setup.exe,.msi}
 #   .../releases/latest/download/keepr-linux-x86_64.{AppImage,deb}
+# The release's display name is an auto-incrementing X.Y.Z (e.g. "Keepr v1.0.1"),
+# computed fresh each run from the PREVIOUS run's name (no version stored in the
+# repo) — see the `publish` job's "Compute next version name" step. Default is
+# a patch bump; a `[minor]` marker anywhere in the triggering commit's message
+# bumps the minor number instead (and resets patch) — `git config alias.minor
+# '!git commit --allow-empty -m "[minor]" && git push'` gives you `git minor`
+# as a one-word way to push a real minor bump instead of the default hotfix.
 # The README platform button row (macOS / Windows / Linux) points at the release page
 # for the user to pick their arch. Docker image publishes only on `v*` tags.
 # ARM Windows / ARM Linux are NOT built (PyInstaller-on-ARM is currently impractical

@@ -172,26 +172,46 @@ jobs:
       - name: List artifacts
         run: ls -la release-assets
 
-      # Increments the release name's X.Y by 0.1 each run, rolling over at
-      # .9 (1.9 -> 2.0) rather than counting past 9 (no 1.10). Reads the
-      # PREVIOUS run's name off the release itself, so no repo file/commit
-      # is needed to persist it between runs; falls back to 1.0 (-> "1.1")
-      # the first time, or if the name doesn't parse.
+      # X.Y.Z, read off the PREVIOUS run's release name (no repo file/commit
+      # needed to persist it between runs). Default is a patch bump (Z, 0-99,
+      # rolling into Y past 99); a "[minor]" marker anywhere in the triggering
+      # commit's message bumps Y instead and resets Z — see the `git minor`
+      # alias in README/CLAUDE.md. Y itself still rolls into X at 10 either
+      # way (1.9.x -> 2.0). Falls back to 1.0.0 the first time, or if the
+      # previous name doesn't parse. Z is dropped from the displayed name
+      # when it's 0, so a fresh minor/major bump reads as "1.1", not "1.1.0".
       - name: Compute next version name
         id: version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          current=$(gh release view latest --repo "${{ github.repository }}" --json name -q .name 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | tail -1)
-          current="${current:-1.0}"
-          major="${current%%.*}"
-          minor="${current#*.}"
-          minor=$((minor + 1))
+          current=$(gh release view latest --repo "${{ github.repository }}" --json name -q .name 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1)
+          current="${current:-1.0.0}"
+          IFS='.' read -r major minor patch <<< "$current"
+          patch="${patch:-0}"
+
+          if printf '%s' "$COMMIT_MSG" | grep -qi '\[minor\]'; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+            if [ "$patch" -ge 100 ]; then
+              minor=$((minor + 1))
+              patch=0
+            fi
+          fi
           if [ "$minor" -ge 10 ]; then
             major=$((major + 1))
             minor=0
           fi
-          echo "name=Keepr v${major}.${minor}" >> "$GITHUB_OUTPUT"
+
+          if [ "$patch" -eq 0 ]; then
+            ver="${major}.${minor}"
+          else
+            ver="${major}.${minor}.${patch}"
+          fi
+          echo "name=Keepr v${ver}" >> "$GITHUB_OUTPUT"
 
       - name: Upload to "latest" release
         uses: softprops/action-gh-release@v2

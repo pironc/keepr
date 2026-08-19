@@ -275,11 +275,11 @@ Copy `.env.example` to `.env` to customize. The essentials:
 
 | Variable | Purpose |
 |---|---|
-| `LLM_DRIVER` | `mock` (default, zero-download) or `llama_cpp` (real local GGUF inference). |
+| `LLM_DRIVER` | `mock` or `llama_cpp`. Leave unset to auto-detect: `llama_cpp` once a real GGUF is actually present (e.g. downloaded/selected in Settings), `mock` otherwise — zero-download by default on a fresh checkout, no env var needed once a model exists. |
 | `LLM_MODEL_PATH` | Path to GGUF file. Only when `LLM_DRIVER=llama_cpp`. Leave unset to use the model picked in the Settings menu. |
 | `LLM_CONTEXT_WINDOW` | Context window size (default auto-detected from `MEMORY_TIER`, typically `8192`). |
 | `LLM_GPU_LAYERS` | Layers to offload to GPU (`-1` = all, default). |
-| `EMBEDDER` | `mock` (default) or `llama_cpp`. |
+| `EMBEDDER` | `mock` or `llama_cpp`. Same auto-detect as `LLM_DRIVER`, evaluated independently. |
 | `EMBEDDING_MODEL_PATH` | Path to GGUF embedding model. Only when `EMBEDDER=llama_cpp`. Leave unset to use the model picked in the Settings menu. |
 | `EMBEDDING_GPU_LAYERS` | Embedding GPU layers (default `0` — embedding runs on CPU to avoid GPU contention with the LLM). |
 | `VECTOR_INDEX_BACKEND` | `flat` (float32, exact) or `quantized` (int8 scalar quant, ~4× less memory). |
