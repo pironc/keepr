@@ -77,7 +77,15 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
-          sudo apt-get update
+          # azure.archive.ubuntu.com (the runner's default in-region mirror,
+          # read from the mirrorlist at /etc/apt/apt-mirrors.txt) is a known,
+          # recurring flaky/unreachable mirror on GitHub-hosted Ubuntu runners
+          # (actions/runner-images#675, #6894) — apt stalls retrying it for a
+          # long time (sometimes hours) before ever falling back to
+          # archive.ubuntu.com, which is what actually serves every package.
+          # Point straight at it instead of waiting out that stall.
+          echo "http://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             build-essential \
