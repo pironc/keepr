@@ -36,6 +36,25 @@
   <img src="../assets/keepr.jpg" alt="keepr — assistant RAG documentaire respectueux de la vie privée" width="820">
 </p>
 
+## Table des matières
+
+- [Pourquoi keepr ?](#pourquoi-keepr-)
+- [Fonctionnalités](#fonctionnalités)
+- [Démarrage](#démarrage)
+  - [Docker](#docker)
+  - [Développement local](#développement-local)
+  - [Variables d'environnement](#variables-denvironnement)
+  - [Exécution avec de vrais modèles locaux](#exécution-avec-de-vrais-modèles-locaux)
+  - [Application bureau native (macOS)](#application-bureau-native-macos)
+- [Développement](#développement)
+  - [Structure du projet](#structure-du-projet)
+  - [Commandes](#commandes)
+  - [Tests](#tests)
+  - [Dépannage](#dépannage)
+- [Licence](#licence)
+
+Pour la justification technologique de chaque choix, la conception complète du système, le format de communication et la stratégie de mise à l'échelle, consultez **[ARCHITECTURE.md](../ARCHITECTURE.md)** (en anglais).
+
 ## Pourquoi keepr ?
 
 La plupart des outils RAG envoient vos documents à une API cloud (risque de confidentialité) ou enveloppent un serveur local opaque comme Ollama (fonctionnement interne obscur). keepr emprunte une troisième voie : **chaque couche est codée à la main, documentée et vous appartient** — des calculs vectoriels jusqu'au streaming des tokens du LLM. La thèse est qu'un système RAG à l'échelle personnelle n'a pas besoin d'infrastructure distribuée ; il a besoin d'un code clair et correct que vous pouvez lire et comprendre de bout en bout.
@@ -98,134 +117,7 @@ Chaque couche est derrière un protocole/ABC — remplacez les implémentations 
 
 ---
 
-## Pile technologique et justifications
-
-Chaque choix dans cette pile a été fait pour une raison spécifique et documentée — pas par convention ou popularité. Consultez [ARCHITECTURE.md](../ARCHITECTURE.md) pour le raisonnement complet ; voici le résumé :
-
-| Couche | Choix | Pourquoi ceci, pas l'alternative |
-|---|---|---|
-| **Langage** | Python 3.12+ | Assez rapide pour une application mono-utilisateur ; l'écosystème ML (numpy, llama-cpp-python) est natif Python. |
-| **Framework API** | FastAPI + uvicorn | Natif asynchrone, streaming SSE intégré, système de types fort via Pydantic v2. |
-| **Inférence LLM** | `llama-cpp-python` (GGUF) | Ollama est plus rapide pour une démo mais opaque en interne. `llama-cpp-python` offre de vrais internes GGUF/K-quant/mmap à partir d'une seule base de code sur Metal, CUDA et CPU — vous pouvez lire exactement comment l'inférence fonctionne. |
-| **Modèle LLM** | Qwen3-8B, Q6_K (~6,7 Go) | Changé de Llama 3.1 8B pour le support multilingue — Qwen domine les benchmarks en langue chinoise avec une large marge et le MMLU multilingue (~80 contre ~72). Q6_K plutôt qu'une quantification plus légère car le budget mémoire a de la place. Les variantes MoE plus récentes (Qwen3.5/3.6) n'ont délibérément pas été choisies : sur les machines à mémoire unifiée (Apple Silicon), les experts MoE inactifs occupent toujours de la RAM réelle — un modèle dense 8B est le meilleur choix pour ce matériel. |
-| **Modèle de vectorisation** | `nomic-embed-text-v2-moe` (GGUF, Q8_0) | Multilingue (~100 langues, 8 experts MoE), 768 dimensions. Même chemin GGUF, même convention de préfixes `search_document:`/`search_query:` que v1.5 — un remplacement direct de la v1.5 uniquement anglaise. |
-| **Stockage vectoriel** | `NumpyFlatIndex` codé à la main (float32, exact) | À l'échelle d'un corpus personnel (milliers d'extraits), la similarité cosinus par force brute n'est *pas* un raccourci — c'est le choix techniquement correct : exact (aucune perte de rappel ANN), sub-milliseconde, et chaque ligne de calcul est explicable. |
-| **Quantification vectorielle** | Quantification scalaire int8 codée à la main | Mise à l'échelle par vecteur min/max vers int8 — réduction de mémoire d'environ 4×, 100 % d'accord du top-1 avec float32 sur des requêtes hors échantillon. Implémenté de zéro parce que le but est de maîtriser la technique, pas de configurer le paramètre de quelqu'un d'autre. |
-| **Analyse PDF** | `pypdf` | Python pur, pas de dépendances natives lourdes, licence permissive (évite les conditions AGPL de PyMuPDF). |
-| **Stockage** | SQLite via `aiosqlite` | Correct pour un utilisateur local unique. La classe `Repository` est le seul module qui parle SQL — le passage à Postgres est contenu dans un seul fichier. |
-| **Frontend** | HTML/CSS/JS vanilla, zéro dépendance | Charger htmx ou Alpine depuis un CDN briserait silencieusement l'affirmation air-gapped au premier chargement de page. Le vendoring ajoute une dépendance tierce à suivre. ~250 lignes de JS simple était le compromis le plus honnête. |
-| **Enveloppe bureau** | Tauri v2 (Rust) | Léger (~5 Mo de surcharge binaire contre plus de 100 Mo pour Electron). Le backend Python est compilé en un binaire autonome via PyInstaller et empaqueté dans le `.app`. |
-| **Gestionnaire de paquets** | pip + hatchling | Outillage Python standard. Les dépendances sont minimales et épinglées de façon lâche (`.>=`), pas verrouillées — approprié pour une application, pas une bibliothèque. |
-| **Linting et vérification de types** | ruff + mypy (`--strict`) | Outillage Python moderne et rapide. L'ensemble de la base de code est strictement typé — `make typecheck` doit réussir. |
-| **Tests** | pytest + pytest-asyncio + pytest-socket | `asyncio_mode = "auto"` donc `async def test_...` fonctionne directement. `--disable-socket` bloque globalement l'accès réseau dans les tests — un test de contrôle positif prouve que le blocage est actif. |
-
----
-
-## Architecture du système
-
-L'application isole le traitement des documents en étapes distinctes et découplées — chacune derrière une interface nommée :
-
-```mermaid
-flowchart TD
-    %% Pipeline d'ingestion
-    Upload[Téléchargement de fichier] --> Ingestor[Extracteur : extraire → TextSegments]
-    Ingestor --> Chunker[Segmenteur : TextSegments → Extraits]
-    Chunker --> Embedder[Vectoriseur : Extraits → Vecteurs]
-    Embedder --> Index[Index vectoriel : ajouter vecteurs + métadonnées]
-
-    %% Pipeline de requête
-    Question[Question de l'utilisateur] --> QEmbed[Vectoriser la requête]
-    QEmbed --> Search[IndexVectoriel.recherche : top-k extraits]
-    Search --> Threshold{Similarité > Seuil ?}
-    Threshold -->|Non| Refuse[Refuser — déterministe, pré-LLM]
-    Threshold -->|Oui| Ground[Ancrer dans l'invite système : tagger les extraits]
-    Ground --> LLM[PiloteLLM : diffuser la réponse token par token]
-    LLM --> Verify[Vérification des citations : test d'appartenance ensembliste]
-    Verify --> Response[SSE : tokens + citations + terminé]
-```
-
-### 1. Pipeline d'ingestion
-Chaque fichier, quel que soit son type, passe par un pipeline uniforme : **extraire → segmenter → vectoriser → indexer**. Chaque implémentation d'`Ingestor` réduit son format source en `TextSegment`s (texte + une `PageRef` ou `TimeRef`) ; la segmentation, la vectorisation, l'indexation et la citation sont 100 % uniformes en aval. C'est la décision de conception unique qui rend l'audio/vidéo extensible ultérieurement — implémenter une vraie transcription signifie remplir une seule méthode `extract()`, rien d'autre.
-
-### 2. L'anti-hallucination est déterministe
-L'invite système (`src/rag/prompts.py`) demande effectivement au modèle de refuser et de citer ses sources — mais c'est la *deuxième* ligne de défense. La première est une comparaison `float` dans `src/rag/engine.py` : si aucune similarité cosinus d'extrait ne franchit `RETRIEVAL_MIN_SIMILARITY`, le moteur renvoie le texte de refus **sans jamais construire d'invite ni appeler le LLM**. La vérification des citations est la même philosophie appliquée en aval : après la génération, chaque tag `[chunk_N]` dans la sortie est vérifié par rapport à l'ensemble des identifiants d'extraits récupérés *pour ce tour spécifique*.
-
-### 3. Périmètre de récupération par conversation
-Les documents sont limités à la conversation dans laquelle ils ont été déposés — pas regroupés dans un index global. Chaque conversation obtient son propre `VectorIndex`, persisté dans `data/index/{conversation_id}.npz` et mis en cache en mémoire après la première utilisation. Cela évite la confusion « pourquoi a-t-il cité quelque chose d'une discussion sans rapport » qu'un index global unique produirait.
-
----
-
-## Structures de données
-
-### Soumission de message (`POST /api/conversations/{id}/messages`)
-Un formulaire multipart avec le texte de la question de l'utilisateur et les nouveaux fichiers mis en attente. Le backend diffuse une réponse SSE unique transportant à la fois la progression de l'ingestion et la réponse :
-
-```
-event: document_status
-data: {"document_id":"d1","filename":"rapport.pdf","status":"extraction"}
-
-event: document_status
-data: {"document_id":"d1","filename":"rapport.pdf","status":"indexé"}
-
-event: message_status
-data: {"status":"récupération"}
-
-event: token
-data: {"token":"Le"}
-
-event: token
-data: {"token":" rapport"}
-
-event: citations
-data: {"citations":[{"chunk_id":"c3","document_id":"d1","document_filename":"rapport.pdf","source_ref":{"kind":"page","page":4},"snippet":"Le chiffre d'affaires a augmenté de 12 % en glissement annuel..."}]}
-
-event: done
-data: {}
-```
-
-### Flux de reconnexion (`GET /api/conversations/{id}/messages/{message_id}/stream`)
-La route qu'une page rafraîchie appelle pour se rattacher à une génération en cours (ou déjà terminée). Renvoie le même flux d'événements SSE, rejouant les tokens déjà émis puis passant en direct.
-
-### Modèles principaux
-Chaque forme partagée vit dans `src/models.py` en tant que modèles Pydantic v2 — source unique de vérité pour le transport et la base de données :
-
-```python
-class SourceRef(PageRef | TimeRef):  # discriminé sur `kind`
-    """Le détail qui rend les citations extensibles à l'audio/vidéo ultérieurement.
-    Ajouter un vrai extracteur audio/vidéo ne produit jamais qu'une nouvelle
-    variante TimeRef — cela ne nécessite jamais de toucher à Chunk, Citation,
-    ou quoi que ce soit en aval."""
-
-class Chunk(BaseModel):
-    id: str
-    document_id: str
-    conversation_id: str
-    text: str
-    source_ref: SourceRef
-    chunk_index: int
-
-class Citation(BaseModel):
-    chunk_id: str
-    document_id: str
-    document_filename: str
-    source_ref: SourceRef
-    snippet: str
-
-class Message(BaseModel):
-    id: str
-    conversation_id: str
-    role: Literal["system", "user", "assistant"]
-    content: str
-    citations: list[Citation]
-    status: MessageStatus  # en_attente → traitement_documents → récupération → génération → terminé | erreur
-    created_at: datetime
-```
-
----
-
 ## Démarrage
-
-Guide complet d'architecture et de mise à l'échelle : **[ARCHITECTURE.md](../ARCHITECTURE.md)**.
 
 ### Docker
 
@@ -464,45 +356,8 @@ Exécutez d'abord `make install` — le paquet doit être installé en mode édi
 
 ---
 
-## Au-delà du simple ordinateur portable
-
-Chaque choix a été pensé pour un seul utilisateur local sur une seule machine — mais aucun n'est une impasse. Voici ce qui change si cela passe sur une machine dédiée :
-
-| Préoccupation | Sur un portable (aujourd'hui) | Sur une machine dédiée | Ce qui change |
-|---|---|---|---|
-| **Taille du modèle** | Qwen3-8B, Q6_K, contexte 8k–16k | Classe 32B+/70B, contexte 32k+ | Variables d'env uniquement — l'échelle de paliers de `config.py` a déjà un palier `server` |
-| **Recherche vectorielle** | NumPy plat codé à la main, exact | Index ANN (Qdrant, LanceDB) à 500K+ vecteurs | Une implémentation `VectorIndex` de plus — même interface |
-| **Stockage** | SQLite, un fichier, un utilisateur | Postgres, utilisateurs simultanés | `repository.py` est le seul module qui parle SQL |
-| **Ingestion** | En ligne par requête | File d'attente de tâches de fond (Celery/arq) | Changement de dispatch — logique du pipeline inchangée |
-| **Audio/vidéo** | Stub propre | Véritable transcription (faster-whisper) | Implémenter `extract()` — tout en aval est prêt |
-
-Le fil conducteur : chacun de ces éléments est une **interface nommée avec exactement une implémentation concrète aujourd'hui**. Passer à l'échelle signifie ajouter une deuxième implémentation derrière une interface qui existe déjà, pas restructurer le système autour d'un nouveau besoin.
-
----
-
-## Ce qui n'est délibérément pas encore construit
-
-Pour être explicite sur le périmètre :
-
-- **Véritable transcription audio/vidéo.** `AudioVideoIngestor.extract()` lève `UnsupportedSourceError` aujourd'hui. Le plan : `faster-whisper`, chargement paresseux, mémoire libérée après usage.
-- **Troncature/résumé de l'historique des conversations.** Les longues conversations envoient actuellement l'historique complet au modèle à chaque tour.
-- **Recherche BM25/mots-clés fusionnée avec la recherche vectorielle** (Reciprocal Rank Fusion) — peu coûteux à ajouter, capture les requêtes par termes exacts que les embeddings manquent.
-- **Un jeu d'évaluation d'ancrage étiqueté** (30 à 50 questions couvrant les catégories répondeur/non répondeur/adversaire, appliqué par CI) — le mécanisme est testé ; un harnais statistique plus large est la prochaine étape naturelle.
-
----
-
-## Principes de conception
-
-1. **Possédez votre pile.** Chaque ligne du pipeline de récupération/indexation/inférence est dans ce dépôt — pas de services boîte noire, pas de « configurez juste ce paramètre ».
-2. **Déterminisme plutôt qu'incitation pour les garanties de sécurité.** L'affirmation principale « n'hallucine pas » repose sur une comparaison de float et un test d'appartenance ensembliste, pas sur la confiance dans le jugement d'un modèle.
-3. **Interfaces avant implémentations.** Chaque frontière de couche est un protocole/ABC. Ajouter un nouveau backend signifie implémenter une interface qui existe déjà.
-4. **L'échelle personnelle n'est pas un raccourci — c'est le point de conception correct.** La recherche exacte par force brute, la concurrence mono-processus et SQLite sont les bons choix à cette échelle, pas des compromis.
-5. **Le mode air-gapped est prouvé, pas affirmé.** La suite de tests bloque tout accès réseau — tout chemin de code qui ouvre une socket fait échouer toute la suite.
-
----
-
 ## Licence
 
-keepr est distribué sous la [licence MIT](LICENSE).
+keepr est distribué sous la [licence MIT](../LICENSE).
 
 🤖 Généré avec [Claude Code](https://claude.com/claude-code)

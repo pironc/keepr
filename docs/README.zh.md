@@ -36,6 +36,25 @@
   <img src="../assets/keepr.jpg" alt="keepr — 隐私优先的文档 RAG 助手" width="820">
 </p>
 
+## 目录
+
+- [为什么选择 keepr？](#为什么选择-keepr)
+- [功能特性](#功能特性)
+- [快速开始](#快速开始)
+  - [Docker](#docker)
+  - [本地开发](#本地开发)
+  - [环境变量](#环境变量)
+  - [使用真实本地模型运行](#使用真实本地模型运行)
+  - [原生桌面应用（macOS）](#原生桌面应用macos)
+- [开发](#开发)
+  - [项目结构](#项目结构)
+  - [命令](#命令)
+  - [测试](#测试)
+  - [故障排除](#故障排除)
+- [许可证](#许可证)
+
+每个技术选择的理由、完整的系统设计、数据传输格式以及扩展方案，见 **[ARCHITECTURE.md](../ARCHITECTURE.md)**（英文）。
+
 ## 为什么选择 keepr？
 
 大多数 RAG 工具要么将你的文档发送到云 API（隐私风险），要么封装一个黑盒本地服务器如 Ollama（内部不透明）。keepr 走了第三条路：**每一层都是手写、有文档记录、由你完全拥有**——从向量索引数学到 LLM 分词流。核心理念是：个人规模的 RAG 系统不需要分布式基础设施；它需要的是清晰、正确、你可以端到端阅读和理解的代码。
@@ -98,133 +117,7 @@
 
 ---
 
-## 技术栈与选型理由
-
-这个技术栈中的每一个选择都有具体的、有文档记录的理由——而非出于惯例或流行度。完整推理见 [ARCHITECTURE.md](../ARCHITECTURE.md)；以下是摘要：
-
-| 层 | 选择 | 为何选它，而不是替代方案 |
-|---|---|---|
-| **语言** | Python 3.12+ | 对单用户应用来说足够快；ML 生态（numpy、llama-cpp-python）是 Python 原生的。 |
-| **API 框架** | FastAPI + uvicorn | 原生异步，内置 SSE 流，通过 Pydantic v2 提供强类型系统。 |
-| **LLM 推理** | `llama-cpp-python`（GGUF） | Ollama 做出演示更快，但内部不透明。`llama-cpp-python` 在一个代码库中提供了真实的 GGUF/K-quant/mmap 内部机制，跨 Metal、CUDA 和 CPU——你可以准确了解推理是如何运行的。 |
-| **LLM 模型** | Qwen3-8B, Q6_K（约 6.7 GB） | 从 Llama 3.1 8B 更换为多语言支持——Qwen 在中文基准测试中以大幅优势领先，多语言 MMLU（约 80 vs. 约 72）。选择 Q6_K 而非更小量化级别是因为内存预算还有余量。刻意未选择更新的 MoE 变体（Qwen3.5/3.6）：在统一内存机器（Apple Silicon）上，未被激活的 MoE 专家仍然占用实际内存——8B 稠密模型更适合这种硬件。 |
-| **嵌入模型** | `nomic-embed-text-v2-moe`（GGUF, Q8_0） | 多语言（约 100 种语言，8 专家 MoE），768 维。使用相同的 GGUF 路径，相同的 `search_document:`/`search_query:` 前缀惯例——可直接从仅支持英文的 v1.5 替换。 |
-| **向量存储** | 手写 `NumpyFlatIndex`（float32，精确） | 在个人规模语料（数千个文本块）下，暴力余弦相似度*不是*走捷径——它在技术上是正确的选择：精确（无 ANN 召回损失），亚毫秒级，且数学运算的每一行都是可解释的。 |
-| **向量量化** | 手写 int8 标量量化 | 逐向量 min/max 缩放到 int8——约 4 倍内存节省，在留出查询上达到 100% top-1 与 float32 一致。从零实现，因为关键是有权拥有这项技术，而不是配置别人的开关。 |
-| **PDF 解析** | `pypdf` | 纯 Python，无重型原生依赖，宽松许可证（避免 PyMuPDF 的 AGPL 条款）。 |
-| **存储** | 通过 `aiosqlite` 的 SQLite | 对单个本地用户是正确选择。`Repository` 类是唯一使用 SQL 的模块——切换到 Postgres 只需修改一个文件。 |
-| **前端** | 原生 HTML/CSS/JS，零依赖 | 从 CDN 加载 htmx 或 Alpine 会在首次页面加载时悄无声息地打破离线声明。内置这些库会增加需追踪的第三方依赖。约 250 行纯 JS 是更诚实的权衡。 |
-| **桌面壳** | Tauri v2（Rust） | 轻量（约 5 MB 二进制开销，对比 Electron 的 100+ MB）。Python 后端通过 PyInstaller 编译为独立可执行文件并打包在 `.app` 中。 |
-| **包管理器** | pip + hatchling | 标准 Python 工具。依赖最小化，版本约束宽松（`.>=`），不做锁定——适用于应用而非库。 |
-| **代码检查与类型检查** | ruff + mypy（`--strict`） | 快速、现代的 Python 工具。整个代码库严格类型化——`make typecheck` 必须通过。 |
-| **测试** | pytest + pytest-asyncio + pytest-socket | `asyncio_mode = "auto"`，所以 `async def test_...` 直接可用。`--disable-socket` 全局阻止测试中的网络访问——正向控制测试证明该阻止确实生效。 |
-
----
-
-## 系统架构
-
-该应用将文档处理隔离为相互独立、解耦的阶段——每个阶段都位于命名接口之后：
-
-```mermaid
-flowchart TD
-    %% Ingestion pipeline
-    Upload[文件上传] --> Ingestor[Ingestor: 提取 → TextSegments]
-    Ingestor --> Chunker[Chunker: TextSegments → 文本块]
-    Chunker --> Embedder[Embedder: 文本块 → 向量]
-    Embedder --> Index[VectorIndex: 添加向量 + 元数据]
-
-    %% Query pipeline
-    Question[用户提问] --> QEmbed[嵌入查询]
-    QEmbed --> Search[VectorIndex.search: top-k 文本块]
-    Search --> Threshold{相似度 > 阈值？}
-    Threshold -->|否| Refuse[拒绝 — 确定性，LLM 调用前]
-    Threshold -->|是| Ground[在系统提示词中植入依据: 标记文本块]
-    Ground --> LLM[LLMDriver: 逐 token 流式输出答案]
-    LLM --> Verify[引用验证: 集合成员关系检查]
-    Verify --> Response[SSE: tokens + citations + done]
-```
-
-### 1. 摄入管线
-每个文件，无论类型，都经过一条统一的管线：**提取→分块→嵌入→索引**。每个 `Ingestor` 实现将其源格式化简为 `TextSegment`（文本 + `PageRef` 或 `TimeRef`）；分块、嵌入、索引和引用在下游 100% 统一。正是这一设计决策使得日后支持音频/视频成为可能——实现真实的转录只需填充一个 `extract()` 方法，别无他物。
-
-### 2. 反幻觉是确定性的
-系统提示词（`src/rag/prompts.py`）确实要求模型拒绝回答并引用来源——但那是*第二道*防线。第一道是 `src/rag/engine.py` 中的一个 `float` 比较：如果没有检索到文本块的余弦相似度超过 `RETRIEVAL_MIN_SIMILARITY`，引擎会返回拒绝文本，**而不会构建提示词或调用 LLM**。引用验证是同样的哲学在下游的应用：生成后，输出中的每个 `[chunk_N]` 标签都会与*该特定轮次*检索到的文本块 ID 集合进行比对。
-
-### 3. 按对话的检索范围
-文档的范围限定在它们被拖入的那个对话内——不会汇入一个全局索引。每个对话拥有自己的 `VectorIndex`，持久化到 `data/index/{conversation_id}.npz`，首次使用后缓存在内存中。这避免了单个全局索引会产生的"为什么它引用了来自不相关聊天的内容"的困惑。
-
----
-
-## 数据结构
-
-### 消息提交 (`POST /api/conversations/{id}/messages`)
-一个包含用户问题文本和任何新暂存文件的 multipart 表单。后端流式返回单个 SSE 响应，同时承载摄入进度和答案：
-
-```
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"extracting"}
-
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"indexed"}
-
-event: message_status
-data: {"status":"retrieving"}
-
-event: token
-data: {"token":"The"}
-
-event: token
-data: {"token":" report"}
-
-event: citations
-data: {"citations":[{"chunk_id":"c3","document_id":"d1","document_filename":"report.pdf","source_ref":{"kind":"page","page":4},"snippet":"Revenue grew 12% YoY..."}]}
-
-event: done
-data: {}
-```
-
-### 重新连接流 (`GET /api/conversations/{id}/messages/{message_id}/stream`)
-刷新后的页面调用此路由以重新连接到进行中（或已完成）的生成。返回相同的 SSE 事件流，重放已完成的 token，然后进入实时传输。
-
-### 核心模型
-每个共享数据结构都定义在 `src/models.py` 中，作为 Pydantic v2 模型——网络传输和数据库的单一真相来源：
-
-```python
-class SourceRef(PageRef | TimeRef):  # 按 `kind` 区分
-    """这个细节使得日后引用可以扩展到音频/视频。
-    添加真正的音频/视频摄入器只会产生一个新的 TimeRef 变体——
-    永远不需要修改 Chunk、Citation 或任何下游内容。"""
-
-class Chunk(BaseModel):
-    id: str
-    document_id: str
-    conversation_id: str
-    text: str
-    source_ref: SourceRef
-    chunk_index: int
-
-class Citation(BaseModel):
-    chunk_id: str
-    document_id: str
-    document_filename: str
-    source_ref: SourceRef
-    snippet: str
-
-class Message(BaseModel):
-    id: str
-    conversation_id: str
-    role: Literal["system", "user", "assistant"]
-    content: str
-    citations: list[Citation]
-    status: MessageStatus  # 排队中 → 处理文档中 → 检索中 → 生成中 → 完成 | 错误
-    created_at: datetime
-```
-
----
-
 ## 快速开始
-
-完整架构和扩展指南：**[ARCHITECTURE.md](../ARCHITECTURE.md)**。
 
 ### Docker
 
@@ -463,45 +356,8 @@ make ci   # ruff check . && mypy && pytest
 
 ---
 
-## 从笔记本向外扩展
-
-每个选择都是为单个本地用户在一台机器上而做的——但没有一个是死胡同。以下是如果迁移到专用机器上需要改变的内容：
-
-| 关注点 | 笔记本上（当前） | 专用机器上 | 需要改变什么 |
-|---|---|---|---|
-| **模型大小** | Qwen3-8B, Q6_K, 8k–16k 上下文 | 32B+/70B 级别, 32k+ 上下文 | 仅环境变量——`config.py` 的层级阶梯已有 `server` 层级 |
-| **向量搜索** | 手写扁平 NumPy，精确 | 50 万+ 向量时的 ANN 索引（Qdrant、LanceDB） | 再多一个 `VectorIndex` 实现——相同的接口 |
-| **存储** | SQLite，一个文件，一个用户 | Postgres，并发用户 | 只有 `repository.py` 使用 SQL |
-| **摄入** | 请求内联处理 | 后台任务队列（Celery/arq） | 调度方式改变——管线逻辑不变 |
-| **音频/视频** | 干净的占位桩 | 真实转录（faster-whisper） | 实现 `extract()`——下游一切已就绪 |
-
-贯穿始终的主线：以上每一项都是一个**命名接口，目前各有一个具体实现**。扩展意味着在已存在的接口后面添加第二个实现，而不是围绕新需求重构整个系统。
-
----
-
-## 刻意尚未构建的部分
-
-明确范围：
-
-- **真实的音频/视频转录。** `AudioVideoIngestor.extract()` 目前抛出 `UnsupportedSourceError`。计划：`faster-whisper`，延迟加载，使用后释放内存。
-- **对话历史截断/摘要。** 长对话目前每轮都将完整历史发送给模型。
-- **BM25/关键词搜索与向量搜索融合**（倒数秩融合）——添加成本低，可以捕捉嵌入遗漏的精确术语查询。
-- **一个标注的依据评估集**（30-50 个问题，涵盖可回答/不可回答/对抗性类别，CI 强制执行）——机制已经过测试；更广泛的统计框架是自然的下一步。
-
----
-
-## 设计原则
-
-1. **拥有你的技术栈。** 检索/索引/推理管线的每一行代码都在这个仓库中——没有黑盒服务，没有"只需配置这个开关"。
-2. **用确定性的方式而非提示词来保证安全性。** 头号"不会幻觉"声明的核心是一个浮点数比较和一个集合成员关系检查，而不是信任模型的判断。
-3. **接口先于实现。** 每个层级边界都是协议/ABC。添加新的后端意味着实现一个已经存在的接口。
-4. **个人规模不是走捷径——它是正确的设计定位。** 暴力精确搜索、单进程并发和 SQLite 在这个规模下是正确的选择，而非妥协。
-5. **离线能力是被证明的，而非口头声明。** 测试套件阻止所有网络访问——任何打开套接字的代码路径都会导致整个套件失败。
-
----
-
 ## 许可证
 
-keepr 基于 [MIT 许可证](LICENSE) 授权。
+keepr 基于 [MIT 许可证](../LICENSE) 授权。
 
 🤖 由 [Claude Code](https://claude.com/claude-code) 生成

@@ -36,6 +36,25 @@
   <img src="../assets/keepr.jpg" alt="keepr — asistente RAG de documentos centrado en la privacidad" width="820">
 </p>
 
+## Índice
+
+- [¿Por qué keepr?](#por-qué-keepr)
+- [Funcionalidades](#funcionalidades)
+- [Primeros pasos](#primeros-pasos)
+  - [Docker](#docker)
+  - [Desarrollo local](#desarrollo-local)
+  - [Variables de entorno](#variables-de-entorno)
+  - [Ejecución con modelos locales reales](#ejecución-con-modelos-locales-reales)
+  - [Aplicación de escritorio nativa (macOS)](#aplicación-de-escritorio-nativa-macos)
+- [Desarrollo](#desarrollo)
+  - [Estructura del proyecto](#estructura-del-proyecto)
+  - [Comandos](#comandos)
+  - [Pruebas](#pruebas)
+  - [Solución de problemas](#solución-de-problemas)
+- [Licencia](#licencia)
+
+Para el fundamento tecnológico de cada decisión, el diseño completo del sistema, el formato de comunicación y la historia de escalado, consulta **[ARCHITECTURE.md](../ARCHITECTURE.md)** (en inglés).
+
 ## ¿Por qué keepr?
 
 La mayoría de las herramientas RAG envían tus documentos a una API en la nube (riesgo de privacidad) o envuelven un servidor local opaco como Ollama (funcionamiento interno inaccesible). keepr toma un tercer camino: **cada capa está construida a mano, documentada y te pertenece** — desde las matemáticas del índice vectorial hasta la transmisión de tokens del LLM. La tesis es que un sistema RAG a escala personal no necesita infraestructura distribuida; necesita código claro y correcto que puedas leer y entender de principio a fin.
@@ -98,134 +117,7 @@ Cada capa está detrás de un protocolo/ABC — intercambia implementaciones sin
 
 ---
 
-## Stack tecnológico y fundamentos
-
-Cada elección en este stack se hizo por una razón específica y documentada — no por convención o popularidad. Consulta [ARCHITECTURE.md](../ARCHITECTURE.md) para el razonamiento completo; aquí va el resumen:
-
-| Capa | Elección | Por qué esto, y no la alternativa |
-|---|---|---|
-| **Lenguaje** | Python 3.12+ | Suficientemente rápido para una app de un solo usuario; el ecosistema ML (numpy, llama-cpp-python) es nativo de Python. |
-| **Framework API** | FastAPI + uvicorn | Nativo en async, streaming SSE integrado, sistema de tipos sólido mediante Pydantic v2. |
-| **Inferencia LLM** | `llama-cpp-python` (GGUF) | Ollama llega más rápido a una demo pero es opaco internamente. `llama-cpp-python` ofrece acceso real a los internos de GGUF/cuantización-K/mmap desde un solo código base en Metal, CUDA y CPU — puedes leer exactamente cómo funciona la inferencia. |
-| **Modelo LLM** | Qwen3-8B, Q6_K (~6.7 GB) | Sustituyó a Llama 3.1 8B por su soporte multilingüe — Qwen lidera los benchmarks en chino por un margen amplio y en MMLU multilingüe (~80 vs. ~72). Q6_K en lugar de una cuantización más ligera porque el presupuesto de memoria lo permite. Las variantes MoE más recientes (Qwen3.5/3.6) se descartaron deliberadamente: en máquinas con memoria unificada (Apple Silicon), los expertos MoE inactivos siguen ocupando RAM real — un modelo denso de 8B se ajusta mejor a este hardware. |
-| **Modelo de incrustación** | `nomic-embed-text-v2-moe` (GGUF, Q8_0) | Multilingüe (~100 idiomas, MoE de 8 expertos), 768 dimensiones. Misma ruta GGUF, misma convención de prefijos `search_document:`/`search_query:` que v1.5 — un reemplazo directo del modelo v1.5 solo en inglés. |
-| **Almacén vectorial** | `NumpyFlatIndex` artesanal (float32, exacto) | A escala de corpus personal (miles de fragmentos), la similitud coseno por fuerza bruta *no* es un atajo — es la elección técnicamente correcta: exacta (sin pérdida de recall ANN), en menos de un milisegundo, y cada línea de las matemáticas es explicable. |
-| **Cuantización vectorial** | Cuantización escalar int8 artesanal | Escalado min/max por vector a int8 — reducción de memoria de ~4×, 100% de concordancia en top-1 con float32 en consultas de prueba. Implementado desde cero porque el objetivo es dominar la técnica, no configurar la opción de otro. |
-| **Parseo de PDF** | `pypdf` | Python puro, sin dependencias nativas pesadas, licencia permisiva (evita los términos AGPL de PyMuPDF). |
-| **Almacenamiento** | SQLite mediante `aiosqlite` | Correcto para un solo usuario local. La clase `Repository` es el único módulo que habla SQL — cambiar a Postgres está contenido en un solo archivo. |
-| **Frontend** | HTML/CSS/JS vanilla, cero dependencias | Cargar htmx o Alpine desde un CDN rompería silenciosamente la afirmación de funcionamiento sin conexión en la primera carga de página. Incluirlos como dependencia local añade una dependencia de terceros que rastrear. ~250 líneas de JS plano fue la decisión más honesta. |
-| **Shell de escritorio** | Tauri v2 (Rust) | Ligero (~5 MB de sobrecarga binaria frente a 100+ MB de Electron). El backend Python se compila a un binario independiente mediante PyInstaller y se empaqueta dentro del `.app`. |
-| **Gestor de paquetes** | pip + hatchling | Herramientas estándar de Python. Las dependencias son mínimas y con versiones flexibles (`.>=`), no bloqueadas — apropiado para una aplicación, no una biblioteca. |
-| **Linting y verificación de tipos** | ruff + mypy (`--strict`) | Herramientas Python modernas y rápidas. Todo el código está estrictamente tipado — `make typecheck` debe pasar. |
-| **Pruebas** | pytest + pytest-asyncio + pytest-socket | `asyncio_mode = "auto"` para que `async def test_...` simplemente funcione. `--disable-socket` bloquea globalmente el acceso a la red en las pruebas — una prueba de control positivo demuestra que el bloqueo está activo. |
-
----
-
-## Arquitectura del sistema
-
-La aplicación aísla el procesamiento de documentos en etapas distintas y desacopladas — cada una detrás de una interfaz con nombre:
-
-```mermaid
-flowchart TD
-    %% Pipeline de ingesta
-    Upload[Subida de archivo] --> Ingestor[Ingestor: extraer → TextSegments]
-    Ingestor --> Chunker[Chunker: TextSegments → Fragmentos]
-    Chunker --> Embedder[Embedder: Fragmentos → Vectores]
-    Embedder --> Index[VectorIndex: añadir vectores + metadatos]
-
-    %% Pipeline de consulta
-    Question[Pregunta del usuario] --> QEmbed[Incrustar consulta]
-    QEmbed --> Search[VectorIndex.search: top-k fragmentos]
-    Search --> Threshold{¿Similitud > Umbral?}
-    Threshold -->|No| Refuse[Rechazar — determinista, previo al LLM]
-    Threshold -->|Sí| Ground[Fundamentar en System Prompt: etiquetar fragmentos]
-    Ground --> LLM[LLMDriver: transmitir respuesta token a token]
-    LLM --> Verify[Verificación de citas: comprobación por pertenencia a conjunto]
-    Verify --> Response[SSE: tokens + citas + done]
-```
-
-### 1. Pipeline de ingesta
-Cada archivo, independientemente de su tipo, pasa por un pipeline uniforme: **extraer → fragmentar → incrustar → indexar**. Cada implementación de `Ingestor` reduce su formato de origen a `TextSegment`s (texto + un `PageRef` o `TimeRef`); la fragmentación, incrustación, indexación y citas son 100% uniformes a partir de ese punto. Esta es la única decisión de diseño que hace que el soporte de audio/vídeo sea ampliable más adelante — implementar la transcripción real significa completar un solo método `extract()`, nada más.
-
-### 2. La anti-alucinación es determinista
-El system prompt (`src/rag/prompts.py`) le pide al modelo que rechace consultas y cite fuentes — pero esa es la *segunda* línea de defensa. La primera es una comparación de `float` en `src/rag/engine.py`: si ningún fragmento recuperado supera el umbral de similitud coseno definido en `RETRIEVAL_MIN_SIMILARITY`, el motor devuelve el texto de rechazo **sin llegar a construir un prompt ni llamar al LLM**. La verificación de citas aplica la misma filosofía aguas abajo: después de la generación, cada etiqueta `[chunk_N]` en la salida se comprueba contra el conjunto de IDs de fragmentos recuperados *para ese turno específico*.
-
-### 3. Alcance de recuperación por conversación
-Los documentos se limitan a la conversación en la que se soltaron — no se agrupan en un índice global. Cada conversación tiene su propio `VectorIndex`, persistido en `data/index/{conversation_id}.npz` y almacenado en caché en memoria tras el primer uso. Esto evita la confusión de «¿por qué citó algo de un chat no relacionado?» que produciría un único índice global.
-
----
-
-## Estructuras de datos
-
-### Envío de mensaje (`POST /api/conversations/{id}/messages`)
-Un formulario multipart con el texto de la pregunta del usuario y cualquier archivo nuevo preparado. El backend transmite una única respuesta SSE que lleva tanto el progreso de ingesta como la respuesta:
-
-```
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"extracting"}
-
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"indexed"}
-
-event: message_status
-data: {"status":"retrieving"}
-
-event: token
-data: {"token":"El"}
-
-event: token
-data: {"token":" informe"}
-
-event: citations
-data: {"citations":[{"chunk_id":"c3","document_id":"d1","document_filename":"report.pdf","source_ref":{"kind":"page","page":4},"snippet":"Los ingresos crecieron un 12% interanual..."}]}
-
-event: done
-data: {}
-```
-
-### Stream de reconexión (`GET /api/conversations/{id}/messages/{message_id}/stream`)
-La ruta que una página recargada llama para reconectarse a una generación en curso (o ya finalizada). Devuelve el mismo stream de eventos SSE, reproduciendo los tokens ya completados y luego continuando en vivo.
-
-### Modelos principales
-Cada forma de datos compartida vive en `src/models.py` como modelos Pydantic v2 — fuente única de verdad tanto para la comunicación como para la base de datos:
-
-```python
-class SourceRef(PageRef | TimeRef):  # discriminado por `kind`
-    """El detalle que hace que las citas sean ampliables a audio/vídeo más adelante.
-    Añadir un ingestor real de audio/vídeo solo produce una nueva variante TimeRef
-    — nunca requiere modificar Chunk, Citation ni nada
-    posterior en la cadena."""
-
-class Chunk(BaseModel):
-    id: str
-    document_id: str
-    conversation_id: str
-    text: str
-    source_ref: SourceRef
-    chunk_index: int
-
-class Citation(BaseModel):
-    chunk_id: str
-    document_id: str
-    document_filename: str
-    source_ref: SourceRef
-    snippet: str
-
-class Message(BaseModel):
-    id: str
-    conversation_id: str
-    role: Literal["system", "user", "assistant"]
-    content: str
-    citations: list[Citation]
-    status: MessageStatus  # queued → processing-documents → retrieving → generating → done | error
-    created_at: datetime
-```
-
----
-
 ## Primeros pasos
-
-Guía completa de arquitectura y escalado: **[ARCHITECTURE.md](../ARCHITECTURE.md)**.
 
 ### Docker
 
@@ -461,43 +353,6 @@ El driver mock analiza las etiquetas `[chunk_N]` del system prompt para obtener 
 **`make run` falla con un error de importación**
 
 Ejecuta `make install` primero — el paquete necesita instalarse en modo editable.
-
----
-
-## Escalar más allá de un portátil
-
-Cada elección se hizo pensando en un único usuario local en una máquina — pero ninguna es un callejón sin salida. Esto es lo que cambia si el sistema se traslada a una máquina dedicada:
-
-| Aspecto | En un portátil (hoy) | En una máquina dedicada | Qué cambia |
-|---|---|---|---|
-| **Tamaño del modelo** | Qwen3-8B, Q6_K, contexto 8k–16k | Clase 32B+/70B, contexto 32k+ | Solo variables de entorno — la escalera de niveles de `config.py` ya tiene un nivel `server` |
-| **Búsqueda vectorial** | NumPy plano artesanal, exacto | Índice ANN (Qdrant, LanceDB) a partir de 500K+ vectores | Una implementación más de `VectorIndex` — misma interfaz |
-| **Almacenamiento** | SQLite, un archivo, un usuario | Postgres, usuarios concurrentes | `repository.py` es el único módulo que habla SQL |
-| **Ingesta** | En línea, por petición | Cola de trabajos en segundo plano (Celery/arq) | Cambio de despacho — la lógica del pipeline no cambia |
-| **Audio/vídeo** | Stub limpio | Transcripción real (faster-whisper) | Implementar `extract()` — todo lo posterior está listo |
-
-El hilo conductor: cada uno de estos es una **interfaz con nombre que hoy tiene exactamente una implementación concreta**. Escalar significa añadir una segunda implementación detrás de una interfaz que ya existe, no reestructurar el sistema en torno a un nuevo requisito.
-
----
-
-## Lo que deliberadamente no se ha construido aún
-
-Siendo explícitos sobre el alcance:
-
-- **Transcripción real de audio/vídeo.** `AudioVideoIngestor.extract()` lanza `UnsupportedSourceError` hoy. El plan: `faster-whisper`, carga diferida, memoria liberada tras su uso.
-- **Truncamiento/resumen del historial de conversación.** Las conversaciones largas actualmente envían el historial completo al modelo en cada turno.
-- **Búsqueda BM25/palabras clave fusionada con búsqueda vectorial** (Reciprocal Rank Fusion) — barato de añadir, captura consultas de términos exactos que las incrustaciones pasan por alto.
-- **Un conjunto de evaluación de fundamentación etiquetado** (30-50 preguntas en categorías respondibles/no respondibles/adversariales, aplicado en CI) — el mecanismo está probado; un sistema estadístico más amplio es el siguiente paso natural.
-
----
-
-## Principios de diseño
-
-1. **Domina tu stack.** Cada línea del pipeline de recuperación/indexación/inferencia está en este repositorio — sin servicios de caja negra, sin «solo configura esta opción».
-2. **Determinismo sobre prompting para garantías de seguridad.** La afirmación principal de «no alucina» descansa en una comparación de floats y una comprobación de pertenencia a conjunto, no en confiar en el juicio de un modelo.
-3. **Interfaces antes que implementaciones.** Cada límite de capa es un protocolo/ABC. Añadir un nuevo backend significa implementar una interfaz que ya existe.
-4. **La escala personal no es un atajo — es el punto de diseño correcto.** La búsqueda exacta por fuerza bruta, la concurrencia de un solo proceso y SQLite son las elecciones correctas a esta escala, no compromisos.
-5. **El funcionamiento sin conexión está demostrado, no afirmado.** La suite de pruebas bloquea todo acceso a la red — cualquier ruta de código que abra un socket hace fallar toda la suite.
 
 ---
 

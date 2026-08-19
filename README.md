@@ -36,6 +36,25 @@
   <img src="assets/keepr.jpg" alt="keepr — privacy-first document RAG assistant" width="820">
 </p>
 
+## Table of Contents
+
+- [Why keepr?](#why-keepr)
+- [Features](#features)
+- [Getting Started](#getting-started)
+  - [Docker](#docker)
+  - [Local Development](#local-development)
+  - [Environment Variables](#environment-variables)
+  - [Running with Real Local Models](#running-with-real-local-models)
+  - [Native Desktop App (macOS)](#native-desktop-app-macos)
+- [Development](#development)
+  - [Project Structure](#project-structure)
+  - [Commands](#commands)
+  - [Testing](#testing)
+  - [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+For the technology rationale behind every choice, the full system design, the wire format, the scaling story, and the design principles, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
 ## Why keepr?
 
 Most RAG tools either send your documents to a cloud API (privacy risk) or wrap a black-box local server like Ollama (opaque internals). keepr takes the third path: **every layer is hand-rolled, documented, and owned by you** — from the vector index math to the LLM token streaming. The thesis is that a personal-scale RAG system doesn't need distributed infrastructure; it needs clear, correct code you can read and understand end-to-end.
@@ -98,135 +117,7 @@ Every layer is behind a protocol/ABC — swap implementations without restructur
 
 ---
 
-## Technology Stack & Rationale
-
-Every choice in this stack was made for a specific, documented reason — not convention or popularity. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full reasoning; here's the summary:
-
-| Layer | Choice | Why this, not the alternative |
-|---|---|---|
-| **Language** | Python 3.12+ | Fast enough for a single-user app; the ML ecosystem (numpy, llama-cpp-python) is Python-native. |
-| **API framework** | FastAPI + uvicorn | Async-native, SSE streaming built in, strong type system via Pydantic v2. |
-| **LLM inference** | `llama-cpp-python` (GGUF) | Ollama is faster to a demo but opaque internally. `llama-cpp-python` gives real GGUF/K-quant/mmap internals from one codebase across Metal, CUDA, and CPU — you can read exactly how inference works. |
-| **Cross-turn KV cache** | Deliberately not enabled | llama.cpp's `cache_prompt` only pays off via prefix reuse, and RAG gives this prompt no reusable prefix: the system message is rebuilt every turn carrying the freshly-retrieved `<context>` chunks, so the first differing token lands early and almost nothing is reused. The costly input — the retrieved context block — is recomputed every answer regardless, and holding a shared cache would keep KV resident in RAM between calls. If multi-turn latency ever matters, the higher-leverage fix is trimming old history / adaptive retrieval size (real token savings), not KV caching. Rationale also in `ARCHITECTURE.md` and `src/rag/prompts.py`. |
-| **LLM model** | Qwen3-8B, Q6_K (~6.7 GB) | Swapped from Llama 3.1 8B for multilingual support — Qwen leads Chinese-language benchmarks by a wide margin and multilingual MMLU (~80 vs. ~72). Q6_K rather than a leaner quant because the memory budget has room. Newer MoE variants (Qwen3.5/3.6) were deliberately not chosen: on unified-memory machines (Apple Silicon), inactive MoE experts still occupy real RAM — an 8B dense model is the better fit for this hardware. |
-| **Embedding model** | `nomic-embed-text-v2-moe` (GGUF, Q8_0) | Multilingual (~100 languages, 8-expert MoE), 768 dimensions. Same GGUF path, same `search_document:`/`search_query:` prefix convention as v1.5 — a drop-in swap from the English-only v1.5. |
-| **Vector store** | Hand-rolled `NumpyFlatIndex` (float32, exact) | At a personal-scale corpus (thousands of chunks), brute-force cosine similarity is *not* a shortcut — it's the technically correct choice: exact (no ANN recall loss), sub-millisecond, and every line of the math is explainable. |
-| **Vector quantization** | Hand-rolled int8 scalar quantization | Per-vector min/max scaling to int8 — ~4× memory reduction, 100% top-1 agreement with float32 on held-out queries. Implemented from scratch because the point is owning the technique, not configuring someone else's flag. |
-| **PDF parsing** | `pypdf` | Pure Python, no heavy native dependencies, permissive license (avoids PyMuPDF's AGPL terms). |
-| **Storage** | SQLite via `aiosqlite` | Correct for a single local user. The `Repository` class is the only module that speaks SQL — a Postgres swap is contained to one file. |
-| **Frontend** | Vanilla HTML/CSS/JS, zero dependencies | Loading htmx or Alpine from a CDN would silently break the air-gapped claim on first page load. Vendoring adds a third-party dependency to track. ~250 lines of plain JS was the more honest trade. |
-| **Desktop shell** | Tauri v2 (Rust) | Lightweight (~5 MB binary overhead vs. 100+ MB for Electron). The Python backend is compiled to a standalone binary via PyInstaller and bundled inside the `.app`. |
-| **Package manager** | pip + hatchling | Standard Python tooling. Dependencies are minimal and pinned loosely (`.>=`), not locked — appropriate for an application, not a library. |
-| **Linting & type checking** | ruff + mypy (`--strict`) | Fast, modern Python tooling. The entire codebase is strictly typed — `make typecheck` must pass. |
-| **Testing** | pytest + pytest-asyncio + pytest-socket | `asyncio_mode = "auto"` so `async def test_...` just works. `--disable-socket` globally blocks network access in tests — a positive-control test proves the block is live. |
-
----
-
-## System Architecture
-
-The application isolates document processing into distinct, decoupled stages — each behind a named interface:
-
-```mermaid
-flowchart TD
-    %% Ingestion pipeline
-    Upload[File Upload] --> Ingestor[Ingestor: extract → TextSegments]
-    Ingestor --> Chunker[Chunker: TextSegments → Chunks]
-    Chunker --> Embedder[Embedder: Chunks → Vectors]
-    Embedder --> Index[VectorIndex: add vectors + metadata]
-
-    %% Query pipeline
-    Question[User Question] --> QEmbed[Embed Query]
-    QEmbed --> Search[VectorIndex.search: top-k chunks]
-    Search --> Threshold{Similarity > Threshold?}
-    Threshold -->|No| Refuse[Refuse — deterministic, pre-LLM]
-    Threshold -->|Yes| Ground[Ground in System Prompt: tag chunks]
-    Ground --> LLM[LLMDriver: stream answer token-by-token]
-    LLM --> Verify[Citation Verification: set-membership check]
-    Verify --> Response[SSE: tokens + citations + done]
-```
-
-### 1. Ingestion Pipeline
-Every file, regardless of type, goes through one uniform pipeline: **extract → chunk → embed → index**. Each `Ingestor` implementation reduces its source format to `TextSegment`s (text + a `PageRef` or `TimeRef`); chunking, embedding, indexing, and citation are 100% uniform downstream of that. This is the single design decision that makes audio/video growable later — implementing real transcription means filling in one `extract()` method, nothing else.
-
-### 2. Anti-Hallucination is Deterministic
-The system prompt (`src/rag/prompts.py`) does ask the model to refuse and cite sources — but that's the *second* line of defense. The first is a `float` comparison in `src/rag/engine.py`: if no retrieved chunk's cosine similarity clears `RETRIEVAL_MIN_SIMILARITY`, the engine returns the refusal text **without ever constructing a prompt or calling the LLM**. Citation verification is the same philosophy applied downstream: after generation, every `[chunk_N]` tag in the output is checked against the set of chunk IDs retrieved *for that specific turn*.
-
-### 3. Per-Conversation Retrieval Scope
-Documents are scoped to the conversation they were dropped into — not pooled into one global index. Each conversation gets its own `VectorIndex`, persisted to `data/index/{conversation_id}.npz` and cached in memory after first use. This avoids the "why did it cite something from an unrelated chat" confusion a single global index would produce.
-
----
-
-## Data Structures
-
-### Message Submission (`POST /api/conversations/{id}/messages`)
-A multipart form with the user's question text and any newly staged files. The backend streams a single SSE response carrying both ingestion progress and the answer:
-
-```
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"extracting"}
-
-event: document_status
-data: {"document_id":"d1","filename":"report.pdf","status":"indexed"}
-
-event: message_status
-data: {"status":"retrieving"}
-
-event: token
-data: {"token":"The"}
-
-event: token
-data: {"token":" report"}
-
-event: citations
-data: {"citations":[{"chunk_id":"c3","document_id":"d1","document_filename":"report.pdf","source_ref":{"kind":"page","page":4},"snippet":"Revenue grew 12% YoY..."}]}
-
-event: done
-data: {}
-```
-
-### Reconnect Stream (`GET /api/conversations/{id}/messages/{message_id}/stream`)
-The route a refreshed page calls to reattach to an in-progress (or already-finished) generation. Returns the same SSE event stream, replaying completed tokens and then going live.
-
-### Core Models
-Every shared shape lives in `src/models.py` as Pydantic v2 models — single source of truth for both the wire and the database:
-
-```python
-class SourceRef(PageRef | TimeRef):  # discriminated on `kind`
-    """The detail that makes citations growable to audio/video later.
-    Adding a real audio/video ingestor only ever produces a new TimeRef
-    variant — it never requires touching Chunk, Citation, or anything
-    downstream."""
-
-class Chunk(BaseModel):
-    id: str
-    document_id: str
-    conversation_id: str
-    text: str
-    source_ref: SourceRef
-    chunk_index: int
-
-class Citation(BaseModel):
-    chunk_id: str
-    document_id: str
-    document_filename: str
-    source_ref: SourceRef
-    snippet: str
-
-class Message(BaseModel):
-    id: str
-    conversation_id: str
-    role: Literal["system", "user", "assistant"]
-    content: str
-    citations: list[Citation]
-    status: MessageStatus  # queued → processing-documents → retrieving → generating → done | error
-    created_at: datetime
-```
-
----
-
 ## Getting Started
-
-Full architecture and scaling guide: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ### Docker
 
@@ -462,43 +353,6 @@ The mock driver parses `[chunk_N]` tags from the system prompt for deterministic
 **`make run` fails with an import error**
 
 Run `make install` first — the package needs to be installed in editable mode.
-
----
-
-## Scaling Past a Laptop
-
-Every choice was picked for a single local user on one machine — but none of them are dead ends. Here's what changes if this moves to a dedicated machine:
-
-| Concern | On a laptop (today) | On a dedicated machine | What changes |
-|---|---|---|---|
-| **Model size** | Qwen3-8B, Q6_K, 8k–16k context | 32B+/70B-class, 32k+ context | Env vars only — `config.py`'s tier ladder already has a `server` tier |
-| **Vector search** | Hand-rolled flat NumPy, exact | ANN index (Qdrant, LanceDB) at 500K+ vectors | One more `VectorIndex` implementation — same interface |
-| **Storage** | SQLite, one file, one user | Postgres, concurrent users | `repository.py` is the only module that speaks SQL |
-| **Ingestion** | Inline per-request | Background job queue (Celery/arq) | Dispatch change — pipeline logic unchanged |
-| **Audio/video** | Clean stub | Real transcription (faster-whisper) | Implement `extract()` — everything downstream is ready |
-
-The throughline: every one of these is a **named interface with exactly one concrete implementation today**. Scaling up means adding a second implementation behind an interface that already exists, not restructuring the system around a new requirement.
-
----
-
-## What's Deliberately Not Built Yet
-
-Being explicit about scope:
-
-- **Real audio/video transcription.** `AudioVideoIngestor.extract()` raises `UnsupportedSourceError` today. The plan: `faster-whisper`, lazy-loaded, memory-purged after use.
-- **Conversation history truncation/summarization.** Long conversations currently send full history to the model every turn.
-- **BM25/keyword search fused with vector search** (Reciprocal Rank Fusion) — cheap to add, catches exact-term queries embeddings miss.
-- **A labeled grounding eval set** (30-50 questions across answerable/unanswerable/adversarial categories, CI-enforced) — the mechanism is tested; a broader statistical harness is the natural next step.
-
----
-
-## Design Principles
-
-1. **Own your stack.** Every line of the retrieval/indexing/inference pipeline is in this repo — no black-box services, no "just configure this flag."
-2. **Determinism over prompting for safety guarantees.** The headline "doesn't hallucinate" claim rests on a float comparison and a set-membership check, not on trusting a model's judgment.
-3. **Interfaces before implementations.** Every layer boundary is a protocol/ABC. Adding a new backend means implementing an interface that already exists.
-4. **Personal scale is not a shortcut — it's the correct design point.** Brute-force exact search, single-process concurrency, and SQLite are the right choices at this scale, not compromises.
-5. **Air-gapped is proven, not claimed.** The test suite blocks all network access — any code path that opens a socket fails the entire suite.
 
 ---
 
