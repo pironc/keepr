@@ -236,17 +236,56 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
 }
 
 fn wait_for_backend(timeout: Duration) -> bool {
-    let client = reqwest::blocking::Client::new();
-    let deadline = std::time::Instant::now();
-    let url = "http://127.0.0.1:8000/health";
-
-    while deadline.elapsed() < timeout {
-        match client.get(url).timeout(Duration::from_millis(500)).send() {
-            Ok(resp) if resp.status().is_success() => return true,
-            _ => std::thread::sleep(Duration::from_millis(250)),
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if probe_health() {
+            return true;
         }
+        std::thread::sleep(Duration::from_millis(250));
     }
     false
+}
+
+/// One `GET /health` attempt against the backend's loopback port.
+///
+/// Hand-rolled instead of pulling in an HTTP client crate: this only ever
+/// talks to a process we just spawned on 127.0.0.1, so there's no TLS, no
+/// redirects, and no proxy env vars to honor — a real HTTP client would
+/// route even a localhost request through `HTTP_PROXY` if the user happened
+/// to have one set, which this can't. A single fixed-size `read()` isn't
+/// guaranteed to return the whole status line in one TCP segment, so this
+/// keeps reading until it sees one, the buffer fills, or the connection ends.
+fn probe_health() -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8000));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut buf = [0u8; 64];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].windows(2).any(|w| w == b"\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf[..filled]).starts_with("HTTP/1.1 200")
 }
 
 fn main() {
