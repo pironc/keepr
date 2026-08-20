@@ -22,6 +22,22 @@ unsafe extern "system" {
 
 struct BackendProcess(Mutex<Option<Child>>);
 
+/// Block until `child` exits or `timeout` elapses. `std::process::Child` has
+/// no blocking-wait-with-timeout in std, so poll `try_wait` instead.
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Kill and reap the backend child if one is still tracked. Shared by every
 /// place that might be the one to actually notice the app is exiting — no
 /// single one of them is reliably first on every platform/quit path, so this
@@ -32,10 +48,42 @@ struct BackendProcess(Mutex<Option<Child>>);
 /// backstop if the state value itself is dropped some other way). Calling it
 /// more than once is harmless: `guard.take()` leaves nothing for the next
 /// caller to act on.
+///
+/// The tracked child is only the PyInstaller onefile *bootloader* — it
+/// unpacks to a temp dir and forks a second, real interpreter process that it
+/// monitors and forwards signals to. `Child::kill()` sends SIGKILL on Unix,
+/// which can never be caught or forwarded by anything: the bootloader dies
+/// instantly, orphaning the interpreter, which then keeps running (and
+/// listening on the port) indefinitely — see tauri-apps/tauri#11686 for the
+/// same PyInstaller/Tauri interaction. SIGTERM instead *can* be relayed by
+/// the bootloader, and uvicorn already shuts down gracefully on it (closing
+/// the DB pool, stopping the workers) — the same SIGTERM path `/api/models/quit`
+/// uses. Only fall back to killing the whole process group (both processes
+/// share one — see `process_group(0)` in `spawn_backend`) if that doesn't
+/// finish quickly, so a hung or non-cooperating bootloader still can't leave
+/// an orphan behind.
 fn kill_backend_process(process: &BackendProcess) {
     if let Ok(mut guard) = process.0.lock() {
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
+            let pid = child.id();
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+                if !wait_for_exit(&mut child, Duration::from_secs(5)) {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &format!("-{pid}")])
+                        .status();
+                }
+            }
+            #[cfg(windows)]
+            {
+                // No forwarding signal on Windows; `/T` walks the OS's own
+                // process-tree bookkeeping so the forked interpreter is
+                // killed along with the bootloader, not just the bootloader.
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status();
+            }
             let _ = child.wait();
         }
     }
@@ -163,7 +211,8 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
 
     let log_file = std::fs::File::create(&log_path).ok()?;
 
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .env("DATABASE_PATH", &db_path)
         .env("INDEX_DIR", &index_dir)
         .env("UPLOAD_DIR", &upload_dir)
@@ -171,9 +220,19 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
         .env("MODEL_SELECTION_PATH", &selection_path)
         .env("PYTHONUNBUFFERED", "1")
         .stdout(log_file.try_clone().unwrap())
-        .stderr(log_file)
-        .spawn()
-        .ok()
+        .stderr(log_file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group (pgid = its own pid), isolated from Tauri's own
+        // group — the PyInstaller bootloader's forked interpreter inherits
+        // it too, so `kill_backend_process`'s group-kill fallback can reach
+        // both processes without ever touching this (Tauri) one.
+        command.process_group(0);
+    }
+
+    command.spawn().ok()
 }
 
 fn wait_for_backend(timeout: Duration) -> bool {
