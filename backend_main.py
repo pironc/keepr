@@ -13,6 +13,7 @@ explicit ``LLM_DRIVER``/``EMBEDDER`` env var still overrides this.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 
@@ -35,6 +36,15 @@ import uvicorn  # noqa: E402
 from src.api.app import app  # noqa: E402
 
 if __name__ == "__main__":
+    # Required for a frozen (PyInstaller) build: src/download.py's model
+    # downloader spawns a child process via multiprocessing.Process, and on
+    # macOS/Windows the "spawn" start method re-launches this very executable
+    # to become that child. freeze_support() is what lets it recognize that
+    # re-launch and run the multiprocessing worker instead of booting a second
+    # full backend on the same port (which would just crash — see the
+    # download-fails-in-the-packaged-app bug this fixes). No-op when running
+    # from source (unfrozen).
+    multiprocessing.freeze_support()
     uvicorn.run(
         app,
         host="127.0.0.1",
