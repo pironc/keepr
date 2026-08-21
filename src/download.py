@@ -14,6 +14,7 @@ import multiprocessing as mp
 import os
 import queue as _queue_lib
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Protocol
@@ -82,6 +83,25 @@ def sha256_of(path: Path, chunk_size: int = 1 << 20) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_of_logged(path: Path, context: str) -> str:
+    """sha256_of, plus a log line — hashing a multi-GB file has no progress
+    events of its own and can run for many seconds, so this is the only way
+    to see it's working (and how long it took) rather than looking stuck."""
+    size_mb = path.stat().st_size / 1e6
+    start = time.monotonic()
+    digest = sha256_of(path)
+    elapsed = time.monotonic() - start
+    logger.info(
+        "model_download: hashed %s (%.0f MB) in %.1fs (%.0f MB/s) — %s",
+        path.name,
+        size_mb,
+        elapsed,
+        size_mb / elapsed if elapsed > 0 else 0,
+        context,
+    )
+    return digest
 
 
 def expected_sha256(repo_id: str, filename: str) -> str:
@@ -310,7 +330,7 @@ async def download_model_with_progress(
     expected = await loop.run_in_executor(None, expected_sha256, repo_id, filename)
 
     if target.exists():
-        local = await loop.run_in_executor(None, sha256_of, target)
+        local = await loop.run_in_executor(None, _sha256_of_logged, target, "pre-check")
         if local == expected:
             yield {
                 "model": model_key,
@@ -435,7 +455,7 @@ async def download_model_with_progress(
         "progress": 1.0,
         "message": "Verifying SHA256…",
     }
-    local = await loop.run_in_executor(None, sha256_of, target)
+    local = await loop.run_in_executor(None, _sha256_of_logged, target, "post-download verify")
     if local == expected:
         yield {
             "model": model_key,

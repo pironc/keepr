@@ -115,4 +115,9 @@ build-backend:
 		backend_main.py
 	mkdir -p src-tauri/binaries
 	cp dist/keepr-backend src-tauri/binaries/keepr-backend-$(TARGET_TRIPLE)
+	# `cp` onto an existing destination only overwrites its content, not its
+	# permission bits — if tauri-dev's non-executable placeholder (above) is
+	# what's sitting there, the "real" binary silently inherits its missing
+	# +x, and the packaged app fails with "Permission denied" at launch.
+	chmod +x src-tauri/binaries/keepr-backend-$(TARGET_TRIPLE)
 	@echo "✓ backend binary → src-tauri/binaries/keepr-backend-$(TARGET_TRIPLE)"

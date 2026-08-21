@@ -194,7 +194,7 @@ fn show_alert(title: &str, message: &str) {
     }
 }
 
-fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
+fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> std::io::Result<Child> {
     let db_path = app_data.join("keepr.db");
     let index_dir = app_data.join("index");
     let upload_dir = app_data.join("uploads");
@@ -209,7 +209,7 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
     let _ = std::fs::create_dir_all(&models_dir);
     let _ = std::fs::create_dir_all(app_data);
 
-    let log_file = std::fs::File::create(&log_path).ok()?;
+    let log_file = std::fs::File::create(&log_path)?;
 
     let mut command = Command::new(binary);
     command
@@ -219,7 +219,7 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
         .env("MODELS_DIR", &models_dir)
         .env("MODEL_SELECTION_PATH", &selection_path)
         .env("PYTHONUNBUFFERED", "1")
-        .stdout(log_file.try_clone().unwrap())
+        .stdout(log_file.try_clone()?)
         .stderr(log_file);
 
     #[cfg(unix)]
@@ -232,7 +232,7 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> Option<Child> {
         command.process_group(0);
     }
 
-    command.spawn().ok()
+    command.spawn()
 }
 
 fn wait_for_backend(timeout: Duration) -> bool {
@@ -322,13 +322,14 @@ fn main() {
                 };
 
                 let child = match spawn_backend(&backend_bin, &data_dir) {
-                    Some(c) => c,
-                    None => {
+                    Ok(c) => c,
+                    Err(err) => {
                         show_alert(
                             "keepr — Backend Error",
                             &format!(
-                                "Could not start the backend.\n\nPath: {}",
-                                backend_bin.display()
+                                "Could not start the backend.\n\nPath: {}\nError: {}",
+                                backend_bin.display(),
+                                err
                             ),
                         );
                         std::process::exit(1);
