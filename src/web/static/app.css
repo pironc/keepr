@@ -1993,6 +1993,48 @@ a:focus-visible,
   border: none;
 }
 
+/* Text/markdown file previews (see renderTextPreview in app.js) — the
+   iframe rules above give PDFs their own scrolling via the native viewer;
+   these need their own scroll container instead since .modal-body itself
+   is overflow:hidden. */
+.modal-scroll {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: var(--space-6);
+}
+
+.file-preview-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* .bubble-content's own code/pre rules (above) only color the background
+   when nested under a .message.assistant/.user bubble; give the same
+   subtle dark overlay here since a file preview sits directly in the
+   (white) modal instead. */
+.file-preview-markdown code {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.file-preview-markdown pre {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.file-preview-unsupported {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+}
+
 /* -- sources panel ----------------------------------------------------- */
 
 .sources-panel {

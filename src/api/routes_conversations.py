@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from src.api.context import AppContext, get_context
+from src.ingestion.text_ingestor import _TEXT_EXTENSIONS
 from src.models import DEFAULT_CONVERSATION_TITLE, Conversation, Document, Message
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -137,8 +138,11 @@ def _media_type_for(filename: str) -> str:
     lower = filename.lower()
     if lower.endswith(".pdf"):
         return "application/pdf"
-    if lower.endswith(".txt"):
-        return "text/plain"
     if lower.endswith(".md"):
         return "text/markdown"
+    # Every other extension TextIngestor accepts (.txt, .py, .json, .csv, ...)
+    # previews the same way — as plain text — so this reuses that single
+    # extension list rather than keeping a second one here that could drift.
+    if lower.endswith(_TEXT_EXTENSIONS):
+        return "text/plain"
     return "application/octet-stream"

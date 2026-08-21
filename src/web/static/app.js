@@ -1212,31 +1212,43 @@ function highlightSource(documentId) {
   entry.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
-// -- citation modal & PDF viewer ---------------------------------------
+// -- citation modal & file preview --------------------------------------
 
 // documentMeta: { documentId: { filename } } — populated by both
 // groupCitationsByDocument (for citation-bearing messages) and
 // updateDocumentStatus (for source-panel entries).
 const _documentMeta = {};
 
-// Blob URL cache — fetch once per document, reuse across modal opens,
-// revoked on page unload. Using a Blob URL (rather than pointing the
-// iframe at the API endpoint) lets the browser's built-in PDF viewer
-// work without a second network round-trip.
-const _documentBlobUrls = {};
+// Blob cache — fetch once per document, reuse across modal opens, revoked
+// on page unload. Using a Blob URL (rather than pointing the iframe/preview
+// at the API endpoint directly) lets the browser's built-in PDF viewer work
+// without a second network round-trip, and lets text/markdown previews read
+// the same already-fetched Blob's bytes instead of fetching twice.
+// contentType comes straight from the fetch Response, mirroring whatever
+// _media_type_for() (routes_conversations.py) decided server-side, so this
+// never needs its own extension list.
+const _documentBlobs = {};
 
 async function _fetchDocumentBlobUrl(documentId) {
-  if (_documentBlobUrls[documentId]) return _documentBlobUrls[documentId];
+  if (_documentBlobs[documentId]) return _documentBlobs[documentId];
   const response = await fetch(
     `/conversations/${state.conversationId}/documents/${documentId}/file`
   );
   if (!response.ok) return null;
   const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  _documentBlobUrls[documentId] = url;
-  return url;
+  const entry = { url: URL.createObjectURL(blob), contentType: blob.type, blob };
+  _documentBlobs[documentId] = entry;
+  return entry;
 }
 
+// PDFs get the browser's built-in viewer via an iframe; any other text-ish
+// type (text/markdown, text/plain — which _media_type_for now also returns
+// for every other ingested extension: .py, .json, .csv, ...) is read as text
+// and rendered directly, since embedding a non-PDF type in an iframe just
+// hits whatever (inconsistent, often blank) native placeholder the webview
+// has for it. Anything left over (no ingestor understands it yet, e.g.
+// audio/video) gets an explicit "can't preview this" state instead of
+// silently falling into that same broken iframe path.
 function openCitationModal(documentId, filename) {
   const modal = document.getElementById("citation-modal");
   const modalBody = document.getElementById("modal-body");
@@ -1247,44 +1259,99 @@ function openCitationModal(documentId, filename) {
     '<div style="padding:24px;text-align:center;color:var(--color-ink-mute)">Loading…</div>';
   document.body.style.overflow = "hidden";
 
-  _fetchDocumentBlobUrl(documentId).then((url) => {
-    if (!url) {
+  _fetchDocumentBlobUrl(documentId).then(async (entry) => {
+    if (!entry) {
       modalBody.innerHTML =
         '<p class="message-status" style="padding:24px">Could not load this file.</p>';
       return;
     }
-    const iframe = document.createElement("iframe");
-    iframe.src = url;
-    iframe.title = filename;
-    iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;";
-    // Escape/Enter typed while focus is inside the PDF viewer never reach
-    // document's own keydown listener above — frame boundaries stop DOM
-    // event bubbling regardless of same-origin-ness. A listener on the
-    // iframe's own contentWindow, once loaded, covers both keys via the
-    // same closeCitationModal() the outer listener uses. Reliable in
-    // WebKit (this app's actual Tauri target — the PDF viewer stays in the
-    // same same-origin blob: document there). Chromium-family engines render
-    // their built-in PDF viewer as an internal extension the iframe
-    // effectively navigates to, making it genuinely cross-origin even
-    // from a same-origin blob src — a hard security boundary, not fixable
-    // from page JS — so this is wrapped in try/catch and silently falls
-    // back to the existing document-level handling plus the always
-    // present Close button in that case.
-    iframe.addEventListener("load", () => {
-      try {
-        iframe.contentWindow.addEventListener("keydown", (evt) => {
-          if (evt.key === "Escape" || (evt.key === "Enter" && !evt.shiftKey)) {
-            evt.preventDefault();
-            closeCitationModal();
-          }
-        });
-      } catch (err) {
-        /* cross-origin PDF viewer — can't attach; see comment above */
-      }
-    });
-    modalBody.innerHTML = "";
-    modalBody.appendChild(iframe);
+    if (entry.contentType === "application/pdf") {
+      renderPdfPreview(modalBody, entry.url, filename);
+    } else if (entry.contentType.startsWith("text/")) {
+      const text = await entry.blob.text();
+      renderTextPreview(modalBody, text, entry.contentType);
+    } else {
+      renderUnsupportedPreview(modalBody, entry.url, filename);
+    }
   });
+}
+
+function renderPdfPreview(modalBody, url, filename) {
+  const iframe = document.createElement("iframe");
+  iframe.src = url;
+  iframe.title = filename;
+  iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;";
+  // Escape/Enter typed while focus is inside the PDF viewer never reach
+  // document's own keydown listener above — frame boundaries stop DOM
+  // event bubbling regardless of same-origin-ness. A listener on the
+  // iframe's own contentWindow, once loaded, covers both keys via the
+  // same closeCitationModal() the outer listener uses. Reliable in
+  // WebKit (this app's actual Tauri target — the PDF viewer stays in the
+  // same same-origin blob: document there). Chromium-family engines render
+  // their built-in PDF viewer as an internal extension the iframe
+  // effectively navigates to, making it genuinely cross-origin even
+  // from a same-origin blob src — a hard security boundary, not fixable
+  // from page JS — so this is wrapped in try/catch and silently falls
+  // back to the existing document-level handling plus the always
+  // present Close button in that case.
+  iframe.addEventListener("load", () => {
+    try {
+      iframe.contentWindow.addEventListener("keydown", (evt) => {
+        if (evt.key === "Escape" || (evt.key === "Enter" && !evt.shiftKey)) {
+          evt.preventDefault();
+          closeCitationModal();
+        }
+      });
+    } catch (err) {
+      /* cross-origin PDF viewer — can't attach; see comment above */
+    }
+  });
+  modalBody.innerHTML = "";
+  modalBody.appendChild(iframe);
+}
+
+// Plain DOM elements (not an iframe), so Escape/Enter reach the existing
+// document-level keydown listener with no extra wiring — unlike the PDF
+// case above, there's no frame boundary here to stop bubbling.
+function renderTextPreview(modalBody, text, contentType) {
+  const scroller = document.createElement("div");
+  scroller.className = "modal-scroll";
+  if (contentType === "text/markdown") {
+    // Reusing bubble-content (see the markdown-rendering section above) —
+    // same DOM-only renderer chat messages use, so a previewed .md file
+    // gets real headings/lists/code, not raw "# " characters. Citation
+    // markers have no meaning outside a chat message, so an empty map: any
+    // literal "[3]" in the file's own text just renders as plain text
+    // (appendTextWithCitations' no-match fallback).
+    const content = document.createElement("div");
+    content.className = "bubble-content file-preview-markdown";
+    renderMessageContent(content, text, new Map());
+    scroller.appendChild(content);
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "file-preview-text";
+    pre.textContent = text;
+    scroller.appendChild(pre);
+  }
+  modalBody.innerHTML = "";
+  modalBody.appendChild(scroller);
+}
+
+function renderUnsupportedPreview(modalBody, url, filename) {
+  modalBody.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "file-preview-unsupported";
+  const msg = document.createElement("p");
+  msg.className = "message-status";
+  msg.textContent = `Preview isn't available for ${filename}.`;
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = "Open in a new tab";
+  wrap.appendChild(msg);
+  wrap.appendChild(link);
+  modalBody.appendChild(wrap);
 }
 
 function closeCitationModal() {
@@ -1304,8 +1371,8 @@ async function handleCitationClick(documentId, event) {
 
   if (event.metaKey || event.ctrlKey) {
     event.preventDefault();
-    const url = await _fetchDocumentBlobUrl(documentId);
-    if (url) window.open(url, "_blank");
+    const entry = await _fetchDocumentBlobUrl(documentId);
+    if (entry) window.open(entry.url, "_blank");
     return;
   }
 
@@ -1315,8 +1382,8 @@ async function handleCitationClick(documentId, event) {
 
 // Revoke blob URLs on unload to prevent memory leaks.
 window.addEventListener("beforeunload", () => {
-  for (const url of Object.values(_documentBlobUrls)) {
-    URL.revokeObjectURL(url);
+  for (const entry of Object.values(_documentBlobs)) {
+    URL.revokeObjectURL(entry.url);
   }
 });
 
@@ -1336,13 +1403,17 @@ function updateDocumentStatus(data, filename) {
       '<span class="source-name"></span>' +
       '<span class="source-initial" aria-hidden="true"></span>' +
       '<span class="source-status"></span>';
-    // Make source entries clickable — opens the citation modal.
+    // Make source entries clickable — opens the citation modal. Reads
+    // entry.dataset.documentId at click time rather than closing over
+    // data.document_id: sendMessage seeds this entry with an optimistic
+    // "pending-N" id before the real one exists, then mutates
+    // entry.dataset.documentId in place once the server assigns one (see
+    // the document_status handler there) — a captured `data.document_id`
+    // would keep referring to the long-gone "pending-N" id forever, 404ing
+    // every click for the entry's whole lifetime.
     entry.style.cursor = "pointer";
     entry.addEventListener("click", (e) => {
-      const fname = _documentMeta[data.document_id]?.filename
-        || entry.querySelector(".source-name").textContent
-        || "source";
-      handleCitationClick(data.document_id, e);
+      handleCitationClick(entry.dataset.documentId, e);
     });
     el.sourcesList.appendChild(entry);
   }
