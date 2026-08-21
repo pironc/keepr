@@ -36,18 +36,21 @@ import uvicorn  # noqa: E402
 from src.api.app import app  # noqa: E402
 
 if __name__ == "__main__":
-    # Required for a frozen (PyInstaller) build: src/download.py's model
-    # downloader spawns a child process via multiprocessing.Process, and on
-    # macOS/Windows the "spawn" start method re-launches this very executable
-    # to become that child. freeze_support() is what lets it recognize that
-    # re-launch and run the multiprocessing worker instead of booting a second
-    # full backend on the same port (which would just crash — see the
-    # download-fails-in-the-packaged-app bug this fixes). No-op when running
-    # from source (unfrozen).
+    # On a frozen build, multiprocessing's "spawn" start method (macOS and
+    # Windows) re-launches this executable to become a child process — e.g.
+    # src/download.py's model downloader. freeze_support() lets it recognize
+    # that re-launch instead of booting a second full backend on the same
+    # port. No-op when running from source.
     multiprocessing.freeze_support()
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=8000,
-        log_level="warning",
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=8000,
+            log_level="warning",
+        )
     )
+    # Read by request_self_quit() (src/api/routes_models.py) for a graceful
+    # shutdown that works the same on every platform.
+    app.state.uvicorn_server = server
+    server.run()

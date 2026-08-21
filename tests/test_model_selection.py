@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.config import (
@@ -256,6 +258,28 @@ def test_request_self_quit_sends_sigterm_to_self(
     assert len(killed) == 1
     assert killed[0][0] == os.getpid()
     assert killed[0][1] == signal.SIGTERM
+
+
+def test_request_self_quit_flips_uvicorn_should_exit_when_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered Server (the packaged app) takes should_exit over SIGTERM —
+    see request_self_quit's docstring for why."""
+    import os
+
+    import src.api.routes_models as rm
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    app = FastAPI()
+    server = SimpleNamespace(should_exit=False)
+    app.state.uvicorn_server = server
+
+    rm.request_self_quit(app)
+
+    assert server.should_exit is True
+    assert killed == []
 
 
 def test_model_open_folder_reveals_models_dir(

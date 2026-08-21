@@ -10,7 +10,7 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -46,17 +46,25 @@ def _available_models(models_dir: Path) -> list[str]:
     return sorted(p.name for p in models_dir.glob("*.gguf") if p.is_file())
 
 
-def request_self_quit() -> None:
+def request_self_quit(app: FastAPI | None = None) -> None:
     """Gracefully shut down the current backend process.
 
-    Sends SIGTERM to our own PID. Uvicorn (both the ``--reload`` dev runner
-    and the packaged ``backend_main.py:uvicorn.run``) handles SIGTERM by
-    running the FastAPI lifespan shutdown, which stops the GenerationWorker,
-    closes the DB pool, and ``aclose``s the LLM driver + embedder — so
-    in-flight chat is wound down and state is flushed before the process
-    exits. Isolated here (rather than inlined in the route) so tests can
-    monkeypatch it without terminating the test runner.
+    Prefers flipping the registered uvicorn ``Server``'s ``should_exit`` flag
+    (set on ``app.state.uvicorn_server`` by ``backend_main.py``) over sending
+    ourselves SIGTERM: on Windows, ``os.kill(self_pid, SIGTERM)`` is an
+    unconditional ``TerminateProcess``, not a catchable signal, so it would
+    skip the FastAPI lifespan shutdown entirely. ``should_exit`` triggers that
+    same graceful shutdown without depending on OS signal delivery, so it
+    works the same on every platform. The SIGTERM fallback only applies when
+    no ``Server`` is registered — the ``uvicorn --reload`` dev runner and the
+    test client, neither of which go through ``backend_main.py``. Isolated
+    here (rather than inlined in the route) so tests can monkeypatch it
+    without terminating the test runner.
     """
+    server = getattr(app.state, "uvicorn_server", None) if app is not None else None
+    if server is not None:
+        server.should_exit = True
+        return
     try:
         os.kill(os.getpid(), signal.SIGTERM)
     except (ProcessLookupError, PermissionError):  # pragma: no cover - defensive
@@ -227,11 +235,11 @@ async def model_delete(
 
 
 @router.post("/quit")
-async def model_quit() -> dict[str, object]:
+async def model_quit(request: Request) -> dict[str, object]:
     """Gracefully shut the backend down once the response has been flushed.
 
     The caller persists the new model via ``/select`` first, then hits this
-    so the change takes effect on next launch. SIGTERM is scheduled as a
+    so the change takes effect on next launch. The shutdown is scheduled as a
     background task with a short delay so the HTTP response body reaches the
     client before the process tears down.
     """
@@ -239,7 +247,7 @@ async def model_quit() -> dict[str, object]:
     # process tears itself down.
     async def _delayed_quit() -> None:
         await asyncio.sleep(0.2)
-        await asyncio.to_thread(request_self_quit)
+        await asyncio.to_thread(request_self_quit, request.app)
 
     asyncio.get_running_loop().create_task(_delayed_quit())
     return {"ok": True}
