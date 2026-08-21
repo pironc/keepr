@@ -9,6 +9,23 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from src.api.routes_conversations import _media_type_for
+
+
+def test_media_type_for_covers_every_ingested_extension() -> None:
+    # .md gets its own type (the frontend renders it through the markdown
+    # renderer); every other TextIngestor extension previews the same way,
+    # as plain text — that's the whole point of reusing _TEXT_EXTENSIONS
+    # instead of hand-listing extensions here too.
+    assert _media_type_for("report.pdf") == "application/pdf"
+    assert _media_type_for("notes.md") == "text/markdown"
+    assert _media_type_for("notes.txt") == "text/plain"
+    assert _media_type_for("script.py") == "text/plain"
+    assert _media_type_for("data.csv") == "text/plain"
+    # Not ingestible by anything today (see AudioVideoIngestor) — previewing
+    # it is out of scope, and it must not silently collapse to text/plain.
+    assert _media_type_for("archive.zip") == "application/octet-stream"
+
 
 def test_health(client: TestClient) -> None:
     response = client.get("/health")
