@@ -989,7 +989,8 @@ function _stopGeneratingRotation() {
 // the backend (src/rag/engine.py's _stream_strip_citation_tags) already
 // removes those from every token before it's ever sent, precisely so
 // nothing here has to reconcile a raw marker appearing live against the
-// differently-numbered citation-marker element "done" renders in its place.
+// differently-numbered "[N]" tag "done" resolves (and drops, per
+// appendTextWithCitations) in its place.
 
 // Underscore italics need a word-boundary guard (unlike `*.*.`) so that
 // snake_case_identifiers — common in this app's own answers — don't get
@@ -1070,9 +1071,12 @@ function parseMarkdownBlocks(text) {
   return blocks;
 }
 
-// Splits on "[N]" markers and renders each as its own clickable element —
-// the one place plain text ever gets citation markers resolved, shared by
-// every block/inline context (paragraphs, list items, bold/italic spans).
+// Splits on "[N]" markers and drops each verified one entirely — per-claim
+// citation UI is intentionally not shown, only the sources panel is. An
+// unmatched "[N]" (numberToGroup has no group for it, so it isn't actually
+// a citation — e.g. literal bracketed text) still renders as plain text,
+// since there's nothing to hide. Shared by every block/inline context
+// (paragraphs, list items, bold/italic spans).
 function appendTextWithCitations(parent, text, numberToGroup) {
   let lastIndex = 0;
   let match;
@@ -1081,16 +1085,7 @@ function appendTextWithCitations(parent, text, numberToGroup) {
     if (match.index > lastIndex) {
       parent.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
     }
-    const group = numberToGroup.get(match[1]);
-    if (group) {
-      const marker = document.createElement("button");
-      marker.type = "button";
-      marker.className = "citation-marker";
-      marker.textContent = `[${group.number}]`;
-      marker.title = group.filename;
-      marker.addEventListener("click", (e) => handleCitationClick(group.documentId, e));
-      parent.appendChild(marker);
-    } else {
+    if (!numberToGroup.get(match[1])) {
       parent.appendChild(document.createTextNode(match[0]));
     }
     lastIndex = _CITATION_MARKER_PATTERN.lastIndex;

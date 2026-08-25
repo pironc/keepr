@@ -1320,26 +1320,6 @@ html.sb-coll {
   border-color: var(--color-ink-mute);
 }
 
-/* Inline [N] markers stay ink, not orange — orange is a one-per-viewport
-   stamp and a message can carry several of these at once. */
-.citation-marker {
-  background: transparent;
-  border: none;
-  color: var(--color-ink);
-  font-family: var(--font-mono);
-  font-size: 0.78em;
-  font-weight: 500;
-  vertical-align: super;
-  padding: 0 1px;
-  cursor: pointer;
-  line-height: 1;
-}
-
-.citation-marker:hover {
-  color: var(--color-orange);
-  text-decoration: underline;
-}
-
 /* -- staged files (pre-submit, client-side only) ---------------------- */
 
 .staged-tray {
@@ -1747,7 +1727,6 @@ button:focus-visible,
 a:focus-visible,
 [role="button"]:focus-visible,
 .citation-badge:focus-visible,
-.citation-marker:focus-visible,
 .staged-chip button:focus-visible,
 .drop-zone:focus-within,
 .search-result-item:focus-visible,
