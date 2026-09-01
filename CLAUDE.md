@@ -125,8 +125,11 @@ data, not an oversight — don't add a migrations framework for it.
   dependency) and `MEMORY_TIERS`, a named ladder (not a hardcoded
   budget) — see ARCHITECTURE.md's scaling section before changing this.
   `load_model_selection`/`save_model_selection` persist the active
-  LLM/embedding filenames to `data/model_selection.json`, applied on the
-  next process start.
+  LLM/embedding filenames to `data/model_selection.json`. Selecting a model
+  now live-swaps it into the running process (the driver/embedder is
+  repointed and any held model unloaded, so the next chat call lazily loads
+  the new file — no restart); the persisted file is what a *later* launch
+  starts from.
 - `src/gguf_meta.py`, `src/model_unavailable.py`, `src/download.py`,
   `src/api/routes_models.py` — the Settings-menu model lifecycle.
   `gguf_meta.py` classifies a `.gguf` as `"llm"` or `"embedding"` by
@@ -140,9 +143,17 @@ data, not an oversight — don't add a migrations framework for it.
   holds the model catalog and download/verify helpers shared between
   `scripts/download_models.py` and `routes_models.py`'s `/api/models/*`
   routes, so the CLI and in-app downloader can't disagree about what to
-  fetch. Switching the active model (`/api/models/select`) persists the
-  choice and then quits the whole app — the new model only actually loads
-  on the next launch, there's no in-process reload. `/api/models/quit`'s
+  fetch. Switching the active model (`/api/models/select`) persisted the
+  choice and then quit the whole app — that is gone: selection now
+  live-swaps the model in-process (see `set_model_path` on the llama.cpp
+  driver/embedder and the `Locked*` wrappers), so an LLM or same-width
+  embedding swap takes effect immediately with no restart and no popup.
+  The one exception is an *embedding* swap to a different vector width:
+  that would invalidate every conversation's search index (the flat index
+  fails loudly on a width mismatch, it can't hold mixed widths), so
+  `/select` refuses it in `model_select` and returns
+  `incompatible_dimensions` for the UI to explain — never a silent break.
+  `/api/models/quit`'s
   `request_self_quit()` sends ourselves SIGTERM so uvicorn's normal
   shutdown path runs first (stops `GenerationWorker`, closes the DB pool,
   `aclose`s the driver/embedder), and app.js's `_quitAppNow()` then tells
