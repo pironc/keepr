@@ -357,11 +357,20 @@ The desktop path works like this:
    no Python installation — the backend is a self-contained executable
    embedded inside the app.
 
-The Tauri layer (`src-tauri/src/lib.rs`) is deliberately thin: it spawns
+The Tauri layer (`src-tauri/src/main.rs`) is deliberately thin: it spawns
 the backend binary as a child process on app launch, waits for the health
 check endpoint to respond, then points the webview at `http://127.0.0.1:8000`.
 On app close, it sends SIGTERM to the backend process. No application logic
 lives in Rust — the boundary is purely process management.
+
+Startup is failure-aware rather than a blind wait: before spawning, `main.rs`
+probes `/health` and adopts an already-running backend (a previous instance
+that didn't shut down) instead of spawning a duplicate or timing out, and it
+watches the child's exit so a backend that dies quickly — almost always
+because port 8000 is still held by a leftover instance — surfaces an immediate,
+specific error instead of stalling through the full health-check window. The
+backend (`backend_main.py`) mirrors that with a fast pre-bind check that logs a
+clear "port in use" message and exits early.
 
 **Why Tauri and not Electron:**
 - Electron bundles an entire Chromium browser (~100+ MB). Tauri uses the
