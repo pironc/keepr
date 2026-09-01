@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterator
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -55,6 +56,23 @@ class LockedEmbedder:
     async def availability(self) -> str | None:
         """Cheap sibling-probe (no model load) forwarded to the inner embedder."""
         return await self._inner.availability()
+
+    async def set_model_path(self, new_path: Path) -> None:
+        """Live-swap the embedding model under the lock — can't race an in-flight
+        embedding pass (same guarantee as embed_documents/embed_query)."""
+        set_path = getattr(self._inner, "set_model_path", None)
+        if set_path is None:
+            return
+        async with self._lock:
+            await asyncio.to_thread(set_path, new_path)
+        # Keep the wrapper's cached dimension in sync so the RAG engine / guard
+        # see the new width.
+        self.dimensions = self._inner.dimensions
+
+    def model_path(self) -> Path:
+        """Current embedding model file (read-only; no lock needed)."""
+        p = getattr(self._inner, "model_path", None)
+        return p() if p is not None else Path()
 
     async def unload(self) -> None:
         """Free the inner model (e.g. after an idle timeout)."""
@@ -93,6 +111,21 @@ class LockedLLMDriver(LLMDriver):
     async def availability(self) -> str | None:
         """Cheap sibling-probe (no model load) forwarded to the inner driver."""
         return await self._inner.availability()
+
+    async def set_model_path(self, new_path: Path) -> None:
+        """Live-swap the LLM under the lock — can't race an in-flight generation.
+        The inner driver exposes a synchronous ``set_model_path`` (file-backed
+        llama.cpp), so it's delegated the same way ``unload`` is."""
+        set_path = getattr(self._inner, "set_model_path", None)
+        if set_path is None:
+            return
+        async with self._lock:
+            await asyncio.to_thread(set_path, new_path)
+
+    def model_path(self) -> Path:
+        """Current LLM file this driver is pointed at (read-only; no lock needed)."""
+        p = getattr(self._inner, "model_path", None)
+        return p() if p is not None else Path()
 
     async def unload(self) -> None:
         """Free the inner model (e.g. after an idle timeout)."""

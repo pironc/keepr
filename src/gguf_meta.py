@@ -96,6 +96,39 @@ def gguf_architecture(meta: dict[str, str]) -> str | None:
     return arch.strip() if arch and arch.strip() else None
 
 
+def gguf_embedding_dimension(path: Path) -> int | None:
+    """Return the embedding vector width of a GGUF model, or ``None`` if it
+    can't be determined from the header.
+
+    Reads ``<arch>.embedding_length`` from the metadata — the token-embedding
+    width, which is the dimension of the vectors an embedding model emits and
+    therefore the width every vector in the flat search index must share.
+    Values in the GGUF header are stored as 32-bit little-endian unsigned
+    integers (surfaced by :func:`read_gguf_metadata` as raw bytes hex such as
+    ``00030000`` for 768); some writers only emit ``embedding_length`` for the
+    base model's token embeddings, so callers treat ``None`` as "unknown —
+    don't block on it" rather than assuming a particular width.
+
+    This reads only the header, never the model weights, so it is cheap enough
+    to call on model selection.
+    """
+    try:
+        meta = read_gguf_metadata(path)
+    except (OSError, ValueError, struct.error):
+        return None
+    arch = gguf_architecture(meta)
+    if not arch:
+        return None
+    raw = meta.get(f"{arch}.embedding_length")
+    if raw is None or len(raw) != 8:
+        return None
+    try:
+        value = int.from_bytes(bytes.fromhex(raw), "little")
+    except ValueError:
+        return None
+    return value
+
+
 def classify_gguf_type(path: Path) -> str | None:
     """Classify a ``.gguf`` as ``"llm"`` or ``"embedding"`` from metadata alone.
 

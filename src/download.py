@@ -63,17 +63,181 @@ def _as_int(value: object) -> int:
 
 logger = get_logger(__name__)
 
-LLM_REPO_ID = "bartowski/Qwen_Qwen3-8B-GGUF"
-LLM_FILENAME = "Qwen_Qwen3-8B-Q6_K.gguf"
 
-EMBEDDING_REPO_ID = "nomic-ai/nomic-embed-text-v2-moe-GGUF"
-EMBEDDING_FILENAME = "nomic-embed-text-v2-moe.Q8_0.gguf"
+class CatalogModel:
+    """One downloadable model in the Settings menu's catalog.
 
-# Map used by the /api/models/download endpoint to resolve "llm"/"embedding" keys.
+    ``repo_id`` + ``filename`` are what ``hf_hub_download`` fetches; ``label``
+    and ``size_hint`` are pure display metadata surfaced to the settings UI so
+    a user can tell the lighter from the heavier options before downloading.
+    ``role`` is ``"llm"`` or ``"embedding"``.
+
+    Immutable after construction (``slots``, no setters) so the catalog is a
+    static, read-only table.
+    """
+
+    __slots__ = ("blurb", "filename", "label", "repo_id", "role", "size_hint")
+
+    def __init__(
+        self,
+        role: str,
+        repo_id: str,
+        filename: str,
+        label: str,
+        size_hint: str,
+        blurb: str = "",
+    ) -> None:
+        self.role = role
+        self.repo_id = repo_id
+        self.filename = filename
+        self.label = label
+        self.size_hint = size_hint
+        self.blurb = blurb
+
+
+# ── Downloadable model catalog ────────────────────────────────────────
+# Two ordered views of the same data:
+#
+#  * ``LLM_MODELS`` / ``EMBEDDING_MODELS`` order the catalog light → heavy for
+#    the settings menu, and
+#  * ``LLM_DEFAULT_MODEL`` / ``EMBEDDING_DEFAULT_MODEL`` pin the historical
+#    defaults (also the persisted default selection in src/config.py) — kept
+#    explicit rather than "first in the list" so the default stays the
+#    full-quality model no matter where it falls in the ordering.
+#
+# Everything here is a public, no-auth Hugging Face repo/GGUF (verified by name
+# and upstream file listing; the official Qwen *source* repos gate anonymous
+# API reads, so the library uses the public bartowski/lm-kit conversions).
+#
+# These are *download* options. Once a file is physically in the models dir its
+# role is classified structurally from GGUF metadata (src/gguf_meta.py), never
+# from this table — so a user is free to drop in any llama.cpp-compatible GGUF
+# and the same catalog simply doesn't list it as a download target.
+
+# LLMs, light → heavy (all instruct/chat GGUFs, llama.cpp-compatible).
+LLM_MODELS: tuple[CatalogModel, ...] = (
+    CatalogModel(
+        role="llm",
+        repo_id="lm-kit/qwen-3-1.7b-instruct-gguf",
+        filename="Qwen3-1.7B-Q8_0.gguf",
+        label="Qwen3-1.7B Instruct (light)",
+        size_hint="~1.7 GB",
+        blurb="Fast, low-RAM chat model — good default on older machines.",
+    ),
+    CatalogModel(
+        role="llm",
+        repo_id="lm-kit/qwen-3-4b-instruct-gguf",
+        filename="Qwen3-4B-Q4_K_M.gguf",
+        label="Qwen3-4B Instruct (light-mid)",
+        size_hint="~2.9 GB",
+        blurb="Balanced speed/quality; still light enough for laptops.",
+    ),
+    # A Q4 cut of the same 8B the default ships as Q6 — a lighter version of
+    # the already-validated architecture, not a different family.
+    CatalogModel(
+        role="llm",
+        repo_id="bartowski/Qwen_Qwen3-8B-GGUF",
+        filename="Qwen_Qwen3-8B-Q4_K_M.gguf",
+        label="Qwen3-8B Instruct (compact)",
+        size_hint="~4.7 GB",
+        blurb="Same 8B quality as default, smaller file.",
+    ),
+    CatalogModel(
+        role="llm",
+        repo_id="bartowski/Qwen_Qwen3-8B-GGUF",
+        filename="Qwen_Qwen3-8B-Q6_K.gguf",
+        label="Qwen3-8B Instruct (default)",
+        size_hint="~6.3 GB",
+        blurb="The default LLM — best quality, needs more RAM.",
+    ),
+)
+
+# Embedders, light → heavy.
+EMBEDDING_MODELS: tuple[CatalogModel, ...] = (
+    CatalogModel(
+        role="embedding",
+        repo_id="nomic-ai/nomic-embed-text-v1.5-GGUF",
+        filename="nomic-embed-text-v1.5.Q8_0.gguf",
+        label="nomic-embed v1.5 (light)",
+        size_hint="~137 MB",
+        blurb="Compact, fast embedder for small-to-medium corpora.",
+    ),
+    CatalogModel(
+        role="embedding",
+        repo_id="nomic-ai/nomic-embed-text-v2-moe-GGUF",
+        filename="nomic-embed-text-v2-moe.Q8_0.gguf",
+        label="nomic-embed v2-moe (default)",
+        size_hint="~488 MB",
+        blurb="The default embedder — strong accuracy, recommended.",
+    ),
+    CatalogModel(
+        role="embedding",
+        repo_id="Qwen/Qwen3-Embedding-0.6B-GGUF",
+        filename="Qwen3-Embedding-0.6B-Q8_0.gguf",
+        label="Qwen3-Embedding 0.6B (heavy)",
+        size_hint="~1.3 GB",
+        blurb="Higher-quality embeddings; needs more RAM at index time.",
+    ),
+)
+
+# The historical defaults a fresh install shipped with (also the persisted
+# default selection in src/config.py). ``download_model_with_progress("llm"/
+# "embedding", dir)`` and the CLI resolve these without a code change.
+LLM_DEFAULT_MODEL = CatalogModel(
+    role="llm",
+    repo_id="bartowski/Qwen_Qwen3-8B-GGUF",
+    filename="Qwen_Qwen3-8B-Q6_K.gguf",
+    label="Qwen3-8B Instruct (default)",
+    size_hint="~6.3 GB",
+    blurb="The default LLM — best quality, needs more RAM.",
+)
+EMBEDDING_DEFAULT_MODEL = CatalogModel(
+    role="embedding",
+    repo_id="nomic-ai/nomic-embed-text-v2-moe-GGUF",
+    filename="nomic-embed-text-v2-moe.Q8_0.gguf",
+    label="nomic-embed v2-moe (default)",
+    size_hint="~488 MB",
+    blurb="The default embedder — strong accuracy, recommended.",
+)
+
 MODEL_DEFS: dict[str, tuple[str, str]] = {
-    "llm": (LLM_REPO_ID, LLM_FILENAME),
-    "embedding": (EMBEDDING_REPO_ID, EMBEDDING_FILENAME),
+    "llm": (LLM_DEFAULT_MODEL.repo_id, LLM_DEFAULT_MODEL.filename),
+    "embedding": (EMBEDDING_DEFAULT_MODEL.repo_id, EMBEDDING_DEFAULT_MODEL.filename),
 }
+
+# Single merged tuple (defaults first, then the rest light → heavy) the settings
+# endpoint ships to the frontend so it can render every download option.
+MODEL_CATALOG: tuple[CatalogModel, ...] = (
+    LLM_DEFAULT_MODEL,
+    *(m for m in LLM_MODELS if m.filename != LLM_DEFAULT_MODEL.filename),
+    EMBEDDING_DEFAULT_MODEL,
+    *(m for m in EMBEDDING_MODELS if m.filename != EMBEDDING_DEFAULT_MODEL.filename),
+)
+
+
+def resolve_catalog_entry(
+    role: str, repo_id: str | None, filename: str | None
+) -> CatalogModel | None:
+    """Pick a catalog entry for a download request.
+
+    Precedence: an explicit ``repo_id``+``filename`` (from the settings list,
+    so a user can pick a specific light/heavy model) wins; otherwise fall back
+    to the role's default model. Returns ``None`` when ``role`` is unknown —
+    the caller rejects that the same way it historically rejected an unknown
+    model key.
+    """
+    if role not in MODEL_DEFS:
+        return None
+    if repo_id and filename:
+        for model in MODEL_CATALOG:
+            if (
+                model.role == role
+                and model.repo_id == repo_id
+                and model.filename == filename
+            ):
+                return model
+        return None
+    return LLM_DEFAULT_MODEL if role == "llm" else EMBEDDING_DEFAULT_MODEL
 
 
 def sha256_of(path: Path, chunk_size: int = 1 << 20) -> str:
@@ -303,11 +467,21 @@ def _download_feed_worker(
 
 
 async def download_model_with_progress(
-    model_key: str, models_dir: Path
+    model_key: str,
+    models_dir: Path,
+    repo_id: str | None = None,
+    filename: str | None = None,
 ) -> AsyncIterator[dict[str, object]]:
-    """Download a model into ``models_dir``, yielding SSE-ready progress dicts."""
+    """Download a model into ``models_dir``, yielding SSE-ready progress dicts.
 
-    if model_key not in MODEL_DEFS:
+    ``model_key`` is the role (``"llm"`` / ``"embedding"``). ``repo_id`` +
+    ``filename`` select a specific catalog entry (lighter/heavier option); when
+    omitted they default to the role's historical default model, so existing
+    callers and the CLI keep working unchanged.
+    """
+
+    entry = resolve_catalog_entry(model_key, repo_id, filename)
+    if entry is None:
         yield {
             "model": model_key,
             "status": "error",
@@ -316,7 +490,8 @@ async def download_model_with_progress(
         }
         return
 
-    repo_id, filename = MODEL_DEFS[model_key]
+    repo_id = entry.repo_id
+    filename = entry.filename
     target = models_dir / filename
 
     # Phase 1: fetch the expected SHA256 from the Hub

@@ -98,6 +98,25 @@ class LlamaCppDriver(LLMDriver):
             self._model.close()
             self._model = None
 
+    def set_model_path(self, new_path: Path) -> None:
+        """Live-swap the model file this driver will load.
+
+        Pointing the driver at a different GGUF mid-session is what lets model
+        selection take effect without an app restart: unload any held model
+        first (so the old one's memory is freed and the next call lazily loads
+        the new file), then remember the new path.  Safe to call when nothing
+        is loaded yet, and safe to call repeatedly.  Callers must hold the
+        driver's lock (see LockedLLMDriver) so a swap can't race an in-flight
+        generation.
+        """
+        if self._model is not None:
+            self.unload()
+        self._model_path = new_path
+
+    def model_path(self) -> Path:
+        """The current model file this driver is pointed at (for reporting)."""
+        return self._model_path
+
     async def aclose(self) -> None:
         """Shutdown cleanup."""
         loop = asyncio.get_running_loop()

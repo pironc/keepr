@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from src.llm.base import LLMDriver
 from src.models import LLMMessage
@@ -37,6 +38,18 @@ def _extract_context_block(system_prompt: str) -> str | None:
 
 
 class MockLLMDriver(LLMDriver):
+    def __init__(self) -> None:
+        # Mirrors the real driver's trackable model file, so live-swapping a
+        # model path is observable/assertable in tests too (the mock has no
+        # actual file, but its path changes with a swap).
+        self._model_path = Path()
+
+    def set_model_path(self, new_path: Path) -> None:
+        self._model_path = new_path
+
+    def model_path(self) -> Path:
+        return self._model_path
+
     async def generate(self, messages: list[LLMMessage]) -> AsyncIterator[str]:
         system_message = next((m for m in messages if m.role == "system"), None)
         context_block = _extract_context_block(system_message.content or "") if system_message else None

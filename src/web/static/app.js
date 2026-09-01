@@ -2149,7 +2149,7 @@ function _anyOverlayActive() {
     document.getElementById("rename-overlay").classList.contains("active") ||
     document.getElementById("settings-overlay").classList.contains("active") ||
     document.getElementById("delete-confirm").getAttribute("aria-hidden") === "false" ||
-    document.getElementById("restart-confirm").getAttribute("aria-hidden") === "false"
+    document.getElementById("model-swap-confirm").getAttribute("aria-hidden") === "false"
   );
 }
 
@@ -2165,14 +2165,14 @@ document.addEventListener("keydown", (e) => {
       renameOverlay.classList.remove("active");
       renameOverlay.setAttribute("aria-hidden", "true");
     }
-    // When the restart-confirm modal is stacked above Settings, a single
+    // When the model-swap notice modal is stacked above Settings, a single
     // Escape should dismiss only the topmost popup (the modal) — never
     // also close Settings and drop straight back to chat. The modal owns
     // its own Escape handling, so skip Settings/context-menu here.
-    const restartModal = document.getElementById("restart-confirm");
-    const restartActive =
-      restartModal && restartModal.classList.contains("active");
-    if (!restartActive) {
+    const swapModal = document.getElementById("model-swap-confirm");
+    const swapActive =
+      swapModal && swapModal.classList.contains("active");
+    if (!swapActive) {
       const settingsOverlay = document.getElementById("settings-overlay");
       if (settingsOverlay && settingsOverlay.classList.contains("active")) {
         closeSettings();
@@ -2227,7 +2227,7 @@ document.addEventListener("keydown", (e) => {
   }
 
   // Cmd/Ctrl+F — open chat search. Guarded: search-overlay's z-index (100)
-  // sits below citation-modal/delete-confirm/restart-confirm (150), so
+  // sits below citation-modal/delete-confirm/model-swap-confirm (150), so
   // opening it under one of those would render invisibly and steal focus
   // into a hidden input; re-opening while already active would stack a
   // second set of listeners (openSearchPopup has no existing-instance guard).
@@ -2609,6 +2609,16 @@ function _esc(s) {
 var _cachedModelStatus = null;
 var _llmMissing = false;
 var _embedderMissing = false;
+// Monotonic counter bumped every time the settings body is re-rendered. Lets
+// a background refresh (e.g. the dropdown-open catalog check, window focus)
+// that started before a newer render detect it's stale, so it won't stomp
+// the newer DOM — most importantly it must not re-open a dropdown the user
+// just closed by selecting a model.
+var _settingsRenderSeq = 0;
+// True for the span of a live model swap (POST /api/models/select running, or
+// its follow-up refresh in flight). Background refreshes check this so they
+// don't repaint/re-open the settings body mid-swap and cause a flicker.
+var _modelSwapActive = false;
 // True once the *first* /api/models/status attempt (success or failure) has
 // completed. Until then, _modelGateBlocked() (see setComposerEnabled) holds
 // the composer disabled with no banner shown, rather than optimistically
@@ -2684,6 +2694,23 @@ async function _checkModelStatus() {
   await _fetchModelStatus();
 }
 
+// Refresh the settings panel from the server, but only if doing so won't
+// clobber a newer state. A live model swap (or any re-render that already
+// happened after this request started) retires a stale refresh immediately.
+// Without this, a slow first status scan — cold backend cache plus GGUF header
+// reads (see _ModelStatusCache; a select also invalidates it) — can land right
+// after the user picks a model and wipe+rebuild the panel, which reads as a
+// "dropdown deleted / panel re-flows" flicker. That's why the glitch showed
+// up mainly on the *first* selection: the cache starts cold, the background
+// refresh is slow, and it collides with the swap.
+function _refreshSettingsBodySafely() {
+  var seq = _settingsRenderSeq;
+  _fetchModelStatus().then(function (data) {
+    if (_modelSwapActive || _settingsRenderSeq !== seq) return;
+    if (data) _renderSettingsBody(data);
+  });
+}
+
 // A cheap fingerprint of the parts of /api/models/status the settings panel
 // renders, used to decide whether a re-render is actually needed on a refresh
 // (avoiding a flicker when nothing on disk changed).
@@ -2695,6 +2722,7 @@ function _modelStatusSignature(data) {
     data.active_llm,
     data.active_embedding,
     data.models,
+    data.downloading,
   ]);
 }
 
@@ -2705,9 +2733,7 @@ function _modelStatusSignature(data) {
 window.addEventListener("focus", function () {
   var overlay = document.getElementById("settings-overlay");
   if (!overlay || !overlay.classList.contains("active")) return;
-  _fetchModelStatus().then(function (data) {
-    if (data) _renderSettingsBody(data);
-  });
+  _refreshSettingsBodySafely();
 });
 
 function closeSettings() {
@@ -2740,12 +2766,12 @@ function openSettings() {
 
   // Render immediately from the cached model status so the model sections are
   // fully drawn when the popup appears (no "Loading…" placeholder that then
-  // expands). Refresh in the background so a later open is up to date.
+  // expands). Refresh in the background so a later open is up to date — but
+  // only if a swap/never render hasn't superseded it meanwhile (the first
+  // status scan is slow, so it must not wipe the panel mid-selection).
   if (_cachedModelStatus) {
     _renderSettingsBody(_cachedModelStatus);
-    _fetchModelStatus().then(function (data) {
-      if (data) _renderSettingsBody(data);
-    });
+    _refreshSettingsBodySafely();
   } else {
     _renderSettingsBody();
   }
@@ -2762,10 +2788,10 @@ function openSettings() {
   }
 
   function onKeyDown(e) {
-    // A restart-confirm modal sits above Settings — let its own Escape
+    // A model-swap notice modal sits above Settings — let its own Escape
     // handler dismiss it first; don't also close Settings here.
-    const restartModal = document.getElementById("restart-confirm");
-    if (restartModal && restartModal.classList.contains("active")) return;
+    const swapModal = document.getElementById("model-swap-confirm");
+    if (swapModal && swapModal.classList.contains("active")) return;
     if (e.key === "Escape") close();
   }
 
@@ -2809,10 +2835,10 @@ async function _renderSettingsBody(data) {
   // only models of the matching kind (an embedding GGUF must never appear in
   // the LLM menu). The backend classifies each file from its GGUF metadata
   // (pooling-layer presence), so third-party models get the right type too.
-  var llmCat = null, embCat = null, typeByName = {};
+  var llmCats = [], embCats = [], typeByName = {};
   for (var c = 0; c < data.models.length; c++) {
-    if (data.models[c].key === "llm") llmCat = data.models[c];
-    if (data.models[c].key === "embedding") embCat = data.models[c];
+    if (data.models[c].key === "llm") llmCats.push(data.models[c]);
+    if (data.models[c].key === "embedding") embCats.push(data.models[c]);
   }
   if (data.types && typeof data.types === "object") {
     for (var name in data.types) {
@@ -2822,8 +2848,8 @@ async function _renderSettingsBody(data) {
     }
   }
 
-  html += _modelCardHtml("Language model", "llm", data.available, data.active_llm, typeByName, llmCat);
-  html += _modelCardHtml("Embedding model", "embedding", data.available, data.active_embedding, typeByName, embCat);
+  html += _modelCardHtml("Language model", "llm", data.available, data.active_llm, typeByName, llmCats);
+  html += _modelCardHtml("Embedding model", "embedding", data.available, data.active_embedding, typeByName, embCats);
 
   html += '<button type="button" class="settings-open-folder-btn" id="open-models-folder">'
     + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -2857,13 +2883,16 @@ async function _renderSettingsBody(data) {
   var openBtn = body.querySelector(".settings-open-folder-btn");
   if (openBtn) openBtn.addEventListener("click", _openModelsFolder);
 
-  // Wire download rows (the catalog-default row is one whole download button)
+  // Wire download rows (each catalog entry that isn't installed is one whole
+  // download button; repo_id/filename pick the specific light/heavy option).
   var buttons = body.querySelectorAll(".settings-dropdown-option-download");
   for (var k = 0; k < buttons.length; k++) {
     buttons[k].addEventListener("click", function () {
       var key = this.dataset.modelKey;
       var name = this.dataset.name || null;
-      _startModelDownload(key, name);
+      var repoId = this.dataset.repoId || null;
+      var filename = this.dataset.filename || null;
+      _startModelDownload(key, name, repoId, filename);
     });
   }
 
@@ -2875,6 +2904,33 @@ async function _renderSettingsBody(data) {
       _deleteModel(this.dataset.deleteTarget);
     });
   }
+
+  // A fresh render rebuilds every download row disabled=false, so re-apply the
+  // per-row lock for any model whose transfer is still in flight. Two signals
+  // feed this:
+  //   * ``_downloadToasts`` — this session's own SSE streams, and
+  //   * ``data.downloading`` — the backend's authoritative in-flight set (from
+  //     /api/models/status), which survives a full frontend reload.
+  // Both name the *filenames* in flight; we map those back to the catalog's
+  // role so the right per-role rows gray out.
+  var inFlightByRole = {};
+  if (data.downloading && data.models) {
+    var dlSet = {};
+    for (var i2 = 0; i2 < data.downloading.length; i2++) dlSet[data.downloading[i2]] = true;
+    for (var m = 0; m < data.models.length; m++) {
+      if (dlSet[data.models[m].filename]) inFlightByRole[data.models[m].key] = true;
+    }
+  }
+  _downloadToasts.forEach(function (entry) {
+    if (entry && entry.lockKey) inFlightByRole[entry.lockKey] = true;
+  });
+  for (var role in inFlightByRole) {
+    if (Object.prototype.hasOwnProperty.call(inFlightByRole, role)) {
+      _lockModelRow(role);
+    }
+  }
+
+  _settingsRenderSeq++;
 }
 
 // A single muted warning banner (icon + message). `inner` is trusted markup
@@ -2896,6 +2952,26 @@ function _trashGlyph() {
 // Checkmark marking the currently-selected model in the dropdown.
 function _checkGlyph() {
   return '<svg class="settings-dropdown-option-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+}
+
+// The same checkmark as _checkGlyph(), but as a live DOM node so it can be
+// moved between dropdown rows in place (the checkmark isn't re-rendered
+// between setting reopens).
+function _checkmarkElement() {
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("class", "settings-dropdown-option-check");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2.5");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  var poly = document.createElementNS(NS, "polyline");
+  poly.setAttribute("points", "20 6 9 17 4 12");
+  svg.appendChild(poly);
+  return svg;
 }
 
 // A small uninstall button for an installed model (default or custom).
@@ -2927,7 +3003,7 @@ async function _deleteModel(target) {
 }
 
 
-function _modelCardHtml(label, role, available, active, typeByName, cat) {
+function _modelCardHtml(label, role, available, active, typeByName, cats) {
   // Options: every .gguf of the matching type (role), INCLUDING the currently
   // active one (marked with a checkmark so it's clear it's selected). Filtering
   // by type keeps an embedding GGUF out of the LLM menu and vice versa.
@@ -2938,7 +3014,17 @@ function _modelCardHtml(label, role, available, active, typeByName, cat) {
   }
   opts.sort();
 
-  var canDownload = !!(cat && !cat.exists && cat.repo_id);
+  // Download targets: every catalog entry for this role that isn't installed
+  // yet (a light → heavy list, so a user picks the size-accuracy tradeoff).
+  // "exist" files only appear as selectable options, never as repeat downloads.
+  var downloadOptions = [];
+  for (var c = 0; c < (cats || []).length; c++) {
+    var entry = cats[c];
+    if (entry && !entry.exists && entry.repo_id) {
+      downloadOptions.push(entry);
+    }
+  }
+  var canDownload = downloadOptions.length > 0;
   // With no downloaded candidates and nothing to download, the trigger is a
   // dead button — disable it so it reads as a label, not a clickable control.
   var nothingToSelect = opts.length === 0 && !canDownload;
@@ -2977,18 +3063,30 @@ function _modelCardHtml(label, role, available, active, typeByName, cat) {
       html += '</div>';
     }
     if (canDownload) {
-      // The catalog default isn't on disk yet — offer it as a row that is
-      // itself one whole download button (the only model type the backend can
-      // fetch), rather than a one-off "download default" button in the card
-      // foot. Being a single <button>, every pixel of it — padding included —
-      // is clickable and the row stays the same height as a plain option.
-      html += '<button type="button" class="settings-dropdown-option settings-dropdown-option-download" data-model-key="' + _esc(role) + '" data-name="' + _esc(cat.filename) + '" data-lock-key="' + _esc(role) + '"'
-        + ' title="Download ' + _esc(cat.filename) + '" aria-label="Download ' + _esc(cat.filename) + '">';
-      html += '<span class="settings-dropdown-option-name">' + _esc(cat.filename) + '</span>';
-      // Hand-authored download-into-tray glyph so the row needs no icon font/CDN.
-      // Sized below the text line-height so it never inflates the row either.
-      html += '<svg class="settings-download-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>';
-      html += '</button>';
+      for (var d = 0; d < downloadOptions.length; d++) {
+        var opt = downloadOptions[d];
+        // Each catalog entry is its own whole download button (one row per
+        // light/heavy option). Every pixel — padding included — is clickable.
+        // repo_id + filename let the backend fetch this specific entry; the
+        // lock key stays the *role* so starting one download disables that
+        // role's other rows while a transfer for it is in flight.
+        var dlTitle = 'Download ' + opt.filename
+          + (opt.size_hint ? ' (' + opt.size_hint + ')' : '')
+          + (opt.blurb ? ' — ' + opt.blurb : '');
+        html += '<button type="button" class="settings-dropdown-option settings-dropdown-option-download"'
+          + ' data-model-key="' + _esc(role) + '"'
+          + ' data-repo-id="' + _esc(opt.repo_id) + '"'
+          + ' data-filename="' + _esc(opt.filename) + '"'
+          + ' data-name="' + _esc(opt.label) + '" data-lock-key="' + _esc(role) + '"'
+          + ' title="' + _esc(dlTitle) + '" aria-label="Download ' + _esc(opt.filename) + '">';
+        html += '<span class="settings-dropdown-option-name">' + _esc(opt.label) + '</span>';
+        if (opt.size_hint) {
+          html += '<span class="settings-dropdown-option-size">' + _esc(opt.size_hint) + '</span>';
+        }
+        // Hand-authored download-into-tray glyph so the row needs no icon font/CDN.
+        html += '<svg class="settings-download-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>';
+        html += '</button>';
+      }
     }
   }
   html += '</div>';
@@ -3002,30 +3100,26 @@ function _modelCardHtml(label, role, available, active, typeByName, cat) {
   return html;
 }
 
-// Selecting a model persists the choice but it only takes effect after the
-// backend restarts. So clicking an option asks for confirmation first: on
-// confirm we persist + quit (the new model loads next launch); on cancel we
-// revert the dropdown to the currently-active model and persist nothing.
-// No transient "Saved" note — the restart prompt *is* the confirmation.
+// Selecting a model live-swaps it into the running process: the backend
+// repoints its driver/embedder at the chosen file and unloads any model,
+// so the very next chat call lazily loads it (surfacing as the normal
+// "generating"/"embedding" state). No restart, no modal, no "Saved" note —
+// a same-width selection just happens. The only popup left is for the one
+// case that genuinely can't swap silently: an embedding-model swap to a
+// different vector width (incompatible with the existing search index), which
+// the backend refuses and signals back.
 function _selectModel(role, filename) {
   var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
   var current = trigger ? (trigger.dataset.active || "") : "";
 
-  // Close the dropdown before showing the modal — the list's high z-index
-  // would otherwise float it above the confirm-backdrop.
-  var list = document.getElementById("list-" + role);
-  _closeDropdownList(list, trigger, true);
-
   if (filename === current) {
     // Clicking the already-active model is a no-op — just close.
+    var noopList = document.getElementById("list-" + role);
+    if (noopList) _closeDropdownList(noopList, trigger, true);
     return;
   }
 
-  // The modal drives the restart action (and the loading state) itself;
-  // this callback only runs on the cancel path — revert to current.
-  _confirmRestart(role, filename, function () {
-    _updateDropdownValue(role, current || "");
-  });
+  _persistModelSelection(role, filename);
 }
 
 function _updateCurrentActive(role, filename) {
@@ -3033,158 +3127,103 @@ function _updateCurrentActive(role, filename) {
   if (trigger) trigger.dataset.active = filename || "";
 }
 
-// Lock the restart modal into a non-dismissible "restarting" state: disable
-// both buttons, swap the Restart label for a clockwise spinner in-place (its
-// box is kept, so the button doesn't reflow), disable Escape/backdrop
-// dismissal, and gray out the Settings "x". The confirm message text is left
-// untouched.
-function _lockRestartModal() {
-  var backdrop = document.getElementById("restart-confirm");
-  if (!backdrop) return;
-  backdrop.classList.add("restart-locked");
-
-  var okBtn = document.getElementById("restart-confirm-ok");
-  var cancelBtn = document.getElementById("restart-confirm-cancel");
-  if (cancelBtn) cancelBtn.disabled = true;
-
-  if (okBtn) {
-    okBtn.disabled = true;
-    okBtn.classList.add("restart-spinner-on");
-
-    // Measure the button *before* touching its content so the replacement
-    // keeps the exact same footprint on screen.
-    var width = okBtn.getBoundingClientRect().width;
-    var height = okBtn.getBoundingClientRect().height;
-    okBtn.textContent = "";
-
-    var spinner = document.createElement("span");
-    spinner.className = "restart-loading";
-    spinner.setAttribute("aria-hidden", "true");
-    okBtn.appendChild(spinner);
-
-    // Pin the measured size so the pill neither expands nor collapses.
-    if (width) okBtn.style.minWidth = width + "px";
-    if (height) okBtn.style.minHeight = height + "px";
-  }
-
-  var closeBtn = document.getElementById("settings-close");
-  if (closeBtn) {
-    closeBtn.disabled = true;
-    closeBtn.classList.add("restart-locked-btn");
-  }
-}
-
-// Tell the Tauri shell to exit now that the backend has quit. Falls back to a
-// no-op when running in a plain browser (no native shell to close).
-function _quitAppNow() {
-  try {
-    var tauri = window.__TAURI__;
-    if (tauri && tauri.core && tauri.core.invoke) {
-      tauri.core.invoke("quit_app");
-    }
-  } catch (_) {
-    // No Tauri runtime (e.g. testing in a browser) — nothing to do.
-  }
-}
-
-async function _persistModelAndQuit(role, filename) {
-  _lockRestartModal();
-  // Stop any in-flight generation first (abort live SSE streams) so the UI
-  // stops streaming before we hand off to the graceful backend shutdown.
-  _abortAllSse();
-
+// Live-swap a model selection via /api/models/select. On success the dropdown
+// reflects the pick and the running process is already repointed. If the
+// backend refuses the swap (embedding dimension change), show a single clear
+// notice and leave the UI/reverts unchanged.
+async function _persistModelSelection(role, filename) {
   var note = document.getElementById("note-" + role);
-  if (note) { note.textContent = "Saving…"; note.className = "settings-model-note"; }
+  var didSwap = false;
+  // Claim the swap so an in-flight background refresh (the dropdown-open
+  // catalog check, window-focus repaint) can't repaint/re-open the panel
+  // mid-swap — that race is what made the embedding control flicker open
+  // and shut again.
+  _modelSwapActive = true;
+  if (note) { note.textContent = "Switching…"; note.className = "settings-model-note"; }
   try {
     var resp = await fetch("/api/models/select", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ role: role, filename: filename })
     });
-    if (!resp.ok) {
-      var err = {};
-      try { err = await resp.json(); } catch (_) {}
-      throw new Error(err.detail || "HTTP " + resp.status);
+    var body = {};
+    try { body = await resp.json(); } catch (_) {}
+    if (!resp.ok) throw new Error(body.detail || "HTTP " + resp.status);
+
+    if (body.incompatible_dimensions) {
+      // The one non-swappable case: the chosen embedder changes the vector
+      // width the existing search index was built with. Don't claim a swap.
+      if (note) { note.textContent = ""; note.className = "settings-model-note"; }
+      _showModelSwapNotice(
+        "Embedding model not switched",
+        body.detail ||
+          "This embedding model uses a different vector width than the one " +
+          "your search index was built with. Switching would not work without " +
+          "re-building every conversation's index first."
+      );
+      return;
     }
+
     _updateDropdownValue(role, filename);
     _updateCurrentActive(role, filename);
-    if (note) { note.textContent = "Restarting…"; note.className = "settings-model-note"; }
-    // Model persisted — now shut the backend down so the choice takes effect
-    // on next launch. The response flushes before the process teardown.
-    try {
-      await fetch("/api/models/quit", { method: "POST" });
-    } catch (_) {
-      // The connection may drop as the backend shuts down — that's expected.
-    }
-    // The backend is now gone — close the Tauri window so the app visibly
-    // quits instead of sitting on the locked restart spinner.
-    _quitAppNow();
+    // Keep the cached status authoritative so the *next* open (which renders
+    // from the cache before any network refresh) shows the new active model
+    // immediately instead of flashing the old one and then correcting it.
+    if (_cachedModelStatus && role === "llm") _cachedModelStatus.active_llm = filename;
+    if (_cachedModelStatus && role === "embedding") _cachedModelStatus.active_embedding = filename;
+    // The active model changed, so any in-flight background refresh that was
+    // about to repaint/re-open a dropdown is now stale — retire it via the
+    // render sequence, exactly as a re-render would, without actually doing a
+    // full panel rebuild (which causes the open-dropdown/height glitch).
+    _settingsRenderSeq++;
+    didSwap = true;
   } catch (err) {
     if (note) { note.textContent = "Error: " + err.message; note.className = "settings-model-note error"; }
+  } finally {
+    _modelSwapActive = false;
+  }
+
+  if (didSwap) {
+    // The trigger label and the dropdown rows' selected/checkmark state were
+    // already updated in place by _updateDropdownValue, and the cache is now
+    // authoritative — so a re-render is not needed (and would wipe+rebuild the
+    // panel, causing a visible flash). Just clear the transient "Switching…"
+    // note. The dropdown stays closed: the user just picked a model.
+    if (note) { note.textContent = ""; note.className = "settings-model-note"; }
   }
 }
 
-// Shows the restart confirm modal. `role`/`filename` are the pending model
-// choice; `onCancel` fires when the user cancels (so the caller can revert
-// the selection). Clicking OK runs `_persistModelAndQuit` directly and keeps
-// the modal open in its locked, loading state — the caller does not need to
-// act on restart. Mirrors `_confirmDelete`'s modal lifecycle (backdrop,
-// Escape, aria state).
-function _confirmRestart(role, filename, onCancel) {
-    var backdrop = document.getElementById("restart-confirm");
-    var message = document.getElementById("restart-confirm-message");
-    var cancelBtn = document.getElementById("restart-confirm-cancel");
-    var okBtn = document.getElementById("restart-confirm-ok");
-    if (!backdrop || !message || !cancelBtn || !okBtn) { if (onCancel) onCancel(); return; }
+// A single-OK informational modal for the (rare) non-swappable embedding pick.
+function _showModelSwapNotice(title, messageText) {
+  var backdrop = document.getElementById("model-swap-confirm");
+  var message = document.getElementById("model-swap-message");
+  var okBtn = document.getElementById("model-swap-ok");
+  if (!backdrop || !message || !okBtn) return;
 
-    message.innerHTML =
-        '<p class="confirm-copy">Switching model requires an app restart.</p>'
-      + '<p class="confirm-copy">Any chat currently processing data will be stopped.</p>'
-      + '<p class="confirm-subtle">Do you wish to proceed?</p>';
+  message.innerHTML =
+      '<p class="confirm-copy">' + _esc(title) + '</p>'
+    + '<p class="confirm-subtle">' + _esc(messageText) + '</p>';
 
-    backdrop.classList.add("active");
-    backdrop.setAttribute("aria-hidden", "false");
-    document.body.style.overflow = "hidden";
-    okBtn.focus();
+  backdrop.classList.add("active");
+  backdrop.setAttribute("aria-hidden", "false");
+  document.body.style.overflow = "hidden";
 
-    function locked() { return backdrop.classList.contains("restart-locked"); }
+  function dismiss() {
+    backdrop.classList.remove("active");
+    backdrop.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = "";
+    okBtn.removeEventListener("click", onOk);
+    backdrop.removeEventListener("click", onBackdrop);
+    document.removeEventListener("keydown", onEscape);
+  }
+  function onOk() { dismiss(); }
+  function onBackdrop(e) { if (e.target === backdrop) dismiss(); }
+  function onEscape(e) { if (e.key === "Escape") dismiss(); }
 
-    function dismiss() {
-      backdrop.classList.remove("active");
-      backdrop.setAttribute("aria-hidden", "true");
-      document.body.style.overflow = "";
-      cancelBtn.removeEventListener("click", handleCancel);
-      okBtn.removeEventListener("click", handleRestart);
-      backdrop.removeEventListener("click", onBackdrop);
-      document.removeEventListener("keydown", onEscape);
-    }
-
-    function handleCancel() {
-      if (locked()) return;
-      dismiss();
-      if (onCancel) onCancel();
-    }
-    function handleRestart() {
-      if (locked()) return;
-      // Keep the modal visible; _persistModelAndQuit locks it (disables the
-      // buttons, shows the spinner, blocks Escape/backdrop/x) then quits.
-      _persistModelAndQuit(role, filename);
-    }
-    function onBackdrop(e) {
-      if (e.target === backdrop && !locked()) handleCancel();
-    }
-    function onEscape(e) {
-      if (e.key === "Escape" && !locked()) {
-        var modal = document.getElementById("citation-modal");
-        if (modal && modal.classList.contains("active")) return;
-        handleCancel();
-      }
-    }
-
-    cancelBtn.addEventListener("click", handleCancel);
-    okBtn.addEventListener("click", handleRestart);
-    backdrop.addEventListener("click", onBackdrop);
-    document.addEventListener("keydown", onEscape);
+  okBtn.addEventListener("click", onOk);
+  backdrop.addEventListener("click", onBackdrop);
+  document.addEventListener("keydown", onEscape);
+  okBtn.focus();
 }
 
 function _updateDropdownValue(role, filename) {
@@ -3196,8 +3235,18 @@ function _updateDropdownValue(role, filename) {
     var options = list.querySelectorAll(".settings-dropdown-option[data-filename]");
     for (var i = 0; i < options.length; i++) {
       var selected = options[i].dataset.filename === filename;
-      options[i].classList.toggle("selected", selected);
       options[i].setAttribute("aria-selected", selected ? "true" : "false");
+      // The selected row must actually *carry* the checkmark, not just an
+      // aria-selected flag — the previous row's checkmark would otherwise stay
+      // orphaned on the old model, so the swap looks like it didn't take. Move
+      // the glyph to the newly-chosen row (and drop it from every other).
+      var check = options[i].querySelector(".settings-dropdown-option-check");
+      var name = options[i].querySelector(".settings-dropdown-option-name");
+      if (selected) {
+        if (!check && name) options[i].insertBefore(_checkmarkElement(), name);
+      } else if (check) {
+        check.remove();
+      }
     }
     // Selecting an option collapses instantly (no animation).
     var trigger = document.querySelector('.settings-dropdown-trigger[data-role="' + role + '"]');
@@ -3258,17 +3307,22 @@ function _toggleModelDropdown(trigger) {
   if (trigger.disabled) return;
   var role = trigger.dataset.role;
 
-  // Refresh the catalog before opening: the models folder is user-editable,
-  // so a file deleted from Finder must disappear from this list immediately.
-  // Re-render only when the data actually changed (otherwise every open would
-  // flicker), then re-resolve the trigger/list since the re-render rebuilt
-  // the DOM.
+  // Open INSTANTLY from the cached status — no network round-trip before the
+  // animation. The settings panel is rendered from _cachedModelStatus, so the
+  // dropdown DOM already exists; opening is purely local. Refresh the catalog
+  // in the background (the models folder is user-editable, so a Finder-deleted
+  // file must disappear): if the data changed, re-render and reopen the same
+  // list; otherwise leave the already-open list alone.
+  _openResolvedDropdown(role);
+
   var before = _modelStatusSignature(_cachedModelStatus);
+  var seq = _settingsRenderSeq;
   _fetchModelStatus().then(function (data) {
-    if (!data || _modelStatusSignature(data) === before) {
-      _openResolvedDropdown(role);
-      return;
-    }
+    // An interrupt already swapped/re-rendered the panel since this refresh
+    // started (or is a swap in flight): don't repaint and re-open what the
+    // user just closed — the swap's own refresh owns state from here.
+    if (_modelSwapActive || _settingsRenderSeq !== seq) return;
+    if (!data || _modelStatusSignature(data) === before) return;
     _renderSettingsBody(data).then(function () {
       _openResolvedDropdown(role);
     });
@@ -3465,7 +3519,7 @@ function _appendDownloadRetry(entry) {
     var key = entry.modelKey;
     var name = entry.name;
     _removeDownloadToast(entry);
-    if (key) _startModelDownload(key, name);
+    if (key) _startModelDownload(key, name, entry.repoId, entry.filename);
   });
   toast.appendChild(btn);
 }
@@ -3545,7 +3599,7 @@ function _releaseModelRow(lockKey) {
   for (var i = 0; i < rows.length; i++) rows[i].disabled = false;
 }
 
-async function _startModelDownload(modelKey, name) {
+async function _startModelDownload(modelKey, name, repoId, filename) {
   // Each download gets its own controller, toast, and row lock.  Downloads are
   // *sequential* on the backend (a shared asyncio.Lock serializes transfers so
   // two writers never race huggingface_hub's cache), but every request is still
@@ -3555,6 +3609,8 @@ async function _startModelDownload(modelKey, name) {
     id: "dl" + (++_downloadSeq),
     modelKey: modelKey,
     name: name || null,
+    repoId: repoId || null,
+    filename: filename || null,
     lockKey: modelKey,
     controller: new AbortController(),
     toast: _makeDownloadToast(),
@@ -3589,10 +3645,15 @@ async function _startModelDownload(modelKey, name) {
   _setDownloadToast(entry, "Queued", null, false);
 
   try {
+    var payload = { model: modelKey };
+    if (repoId && filename) {
+      payload.repo_id = repoId;
+      payload.filename = filename;
+    }
     var response = await fetch("/api/models/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: modelKey }),
+      body: JSON.stringify(payload),
       signal: entry.controller.signal,
     });
 

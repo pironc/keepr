@@ -1647,22 +1647,19 @@ html.sb-coll {
 }
 
 /* No pointer-events:none here on purpose: the native `disabled` attribute
-   (or, for restart-locked-btn, the caller setting .disabled itself) already
-   blocks clicks at the browser level. pointer-events:none would additionally
-   stop the element from being the *hit-test target* at all — for a button
-   sitting inside a `cursor: text` container (the composer's drop-zone), that
-   makes the cursor fall through to the ancestor and show an I-beam over a
-   disabled icon button instead of this rule's own `cursor: default`. The
-   :hover reset below achieves the "no hover highlight while disabled" look
-   without that side effect. */
-.icon-btn.restart-locked-btn,
+   already blocks clicks at the browser level. pointer-events:none would
+   additionally stop the element from being the *hit-test target* at all —
+   for a button sitting inside a `cursor: text` container (the composer's
+   drop-zone), that makes the cursor fall through to the ancestor and show
+   an I-beam over a disabled icon button instead of this rule's own
+   `cursor: default`. The :hover reset below achieves the "no hover
+   highlight while disabled" look without that side effect. */
 .icon-btn:disabled,
 #settings-close[disabled] {
   opacity: 0.45;
   cursor: default;
 }
 
-.icon-btn.restart-locked-btn:hover,
 .icon-btn:disabled:hover,
 #settings-close[disabled]:hover {
   background: transparent;
@@ -1879,33 +1876,6 @@ a:focus-visible,
 
 .confirm-btn-cancel:disabled:hover {
   background: var(--color-surface-bone);
-}
-
-.confirm-btn-restart:disabled:hover {
-  background: var(--color-orange);
-}
-
-/* Clockwise ring spinner shown inside the Restart button once it is clicked.
-   Reuses the shared `spin` keyframe (rotates 0 -> 360deg, i.e. clockwise).
-   Sized to sit where the "Restart" label was, without reflowing the pill
-   (the button's measured width/height are pinned from JS). */
-.restart-loading {
-  display: inline-block;
-  width: calc(13px * var(--zoom));
-  height: calc(13px * var(--zoom));
-  border-radius: var(--radius-pill);
-  border: 2px solid rgba(255, 255, 255, 0.35);
-  border-top-color: #fff;
-  animation: spin 0.7s linear infinite;
-  flex: 0 0 auto;
-}
-
-/* Center the spinner inside the enlarged click target of the Restart pill. */
-.confirm-btn.restart-spinner-on {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
 }
 
 /* -- citation modal --------------------------------------------------- */
@@ -3351,6 +3321,17 @@ html.resizing .sidebar * {
 .settings-dropdown-option-download .settings-download-glyph {
   flex-shrink: 0;
   margin-left: var(--space-3);
+}
+
+/* Size hint on a downloadable catalog row (e.g. "~1.7 GB"), muted and tucked
+   beside the model label so a user can weigh size vs. accuracy before
+   downloading. Flex-end keeps it right-aligned; ellipsis guards narrow widths. */
+.settings-dropdown-option-download .settings-dropdown-option-size {
+  font-size: 0.625rem;
+  color: var(--color-ink-mute);
+  margin-left: auto;
+  padding-left: var(--space-3);
+  flex-shrink: 0;
 }
 
 .settings-dropdown-empty {

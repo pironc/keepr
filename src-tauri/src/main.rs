@@ -235,15 +235,44 @@ fn spawn_backend(binary: &PathBuf, app_data: &PathBuf) -> std::io::Result<Child>
     command.spawn()
 }
 
-fn wait_for_backend(timeout: Duration) -> bool {
+/// Outcome of waiting for the freshly spawned backend to become healthy.
+#[derive(PartialEq)]
+enum WaitResult {
+    /// The backend answered ``/health`` with 200 in time.
+    Healthy,
+    /// The spawned backend process exited before ever becoming healthy — a
+    /// definitive startup failure (almost always a port-conflict: it can't
+    /// bind 127.0.0.1:8000 because a previous instance is still there). There
+    /// is no point waiting out the rest of the timeout; surface it now.
+    ChildExited,
+    /// The backend neither became healthy nor exited within the window — a
+    /// hung or stuck startup.
+    Timeout,
+}
+
+/// Poll ``/health`` until the backend is up, the child exits, or the timeout
+/// elapses (whichever comes first).
+///
+/// Detecting an early child exit is what turns the old blind 30-second stall
+/// into an immediate, specific error: a backend that fails to bind dies fast,
+/// and calling ``try_wait()`` each loop catches that in the first ~250 ms
+/// instead of waiting out the whole window.
+fn wait_for_backend(child: &mut Child, timeout: Duration) -> WaitResult {
     let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    loop {
         if probe_health() {
-            return true;
+            return WaitResult::Healthy;
+        }
+        // The backend died before serving — stop waiting (a bind conflict is
+        // the usual cause; see backend_main's port_in_use pre-check).
+        if let Ok(Some(_)) = child.try_wait() {
+            return WaitResult::ChildExited;
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitResult::Timeout;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    false
 }
 
 /// One `GET /health` attempt against the backend's loopback port.
@@ -321,7 +350,31 @@ fn main() {
                     }
                 };
 
-                let child = match spawn_backend(&backend_bin, &data_dir) {
+                // Pre-flight: is a keepr backend already answering on the port?
+                // If so, a previous instance didn't shut down (its shell exited
+                // without reaping the backend, leaving it orphaned). Spawning a
+                // second backend would just fail to bind, and waiting out the
+                // health time-out tells the user nothing. Detect it now, tell
+                // them why, and adopt the already-running backend rather than
+                // erroring out — the app works, and the message explains the
+                // orphan for next time. We deliberately DON'T kill it here:
+                // killing a possibly-intended running instance is riskier than
+                // informing the user.
+                if probe_health() {
+                    show_alert(
+                        "keepr — Already Running",
+                        "A previous Keepr instance is still running.\n\
+                         Keepr will use the running backend.\n\n\
+                         If the window doesn't show, close the previous\n\
+                         instance (or its stray backend process) and relaunch.",
+                    );
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.navigate("http://127.0.0.1:8000".parse().unwrap());
+                    }
+                    return Ok(());
+                }
+
+                let mut child = match spawn_backend(&backend_bin, &data_dir) {
                     Ok(c) => c,
                     Err(err) => {
                         show_alert(
@@ -335,18 +388,46 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-
-                app.manage(BackendProcess(Mutex::new(Some(child))));
                 println!("keepr: data directory → {}", data_dir.display());
 
-                if !wait_for_backend(Duration::from_secs(30)) {
-                    show_alert(
-                        "keepr — Timeout",
-                        "The backend did not start within 30 seconds.\n\
-                         Check the logs in the data directory.",
-                    );
-                    std::process::exit(1);
+                // Wait for the backend to come up, but bail fast on an early
+                // child exit (port conflict) or the overall health time-out,
+                // reaping the child so we never leave a new orphan behind.
+                // The child is handed to app.manage() only once it's healthy,
+                // so the failure paths own disposal themselves.
+                let result = wait_for_backend(&mut child, Duration::from_secs(30));
+                let mut child_guard = Some(child);
+                match result {
+                    WaitResult::Healthy => {}
+                    WaitResult::ChildExited => {
+                        show_alert(
+                            "keepr — Backend Stopped",
+                            "The backend exited during startup.\n\n\
+                             The most common cause is port 8000 already being\n\
+                             in use by a previous Keepr instance — close it\n\
+                             and relaunch. See backend.log for details.",
+                        );
+                        if let Some(mut c) = child_guard.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        std::process::exit(1);
+                    }
+                    WaitResult::Timeout => {
+                        show_alert(
+                            "keepr — Timeout",
+                            "The backend did not become healthy within 30 seconds.\n\
+                             Check the logs in the data directory.",
+                        );
+                        if let Some(mut c) = child_guard.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        std::process::exit(1);
+                    }
                 }
+
+                app.manage(BackendProcess(Mutex::new(child_guard.take())));
 
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.navigate("http://127.0.0.1:8000".parse().unwrap());

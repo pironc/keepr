@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from src.gguf_meta import gguf_embedding_dimension
 from src.logger import get_logger
 from src.model_unavailable import ModelRole, ModelUnavailableError
 
@@ -47,7 +48,14 @@ class LlamaCppEmbedder:
         self._model_path = model_path
         self._n_gpu_layers = n_gpu_layers
         self._model: Any = None
+        # Best-effort width so the vector index can be sanity-checked without
+        # loading the model eagerly. The compile-time default is the nomic
+        # family's 768; when a different embedder (or a swap) points at another
+        # file we refresh this from its GGUF header via set_model_path.
         self.dimensions: int = _NOMIC_EMBED_DIMENSIONS
+        detected = gguf_embedding_dimension(model_path)
+        if detected is not None:
+            self.dimensions = detected
 
     async def embed_documents(self, texts: list[str]) -> NDArray[np.float32]:
         prefixed = [f"{_DOCUMENT_PREFIX}{text}" for text in texts]
@@ -117,6 +125,26 @@ class LlamaCppEmbedder:
             logger.info("llama_cpp: unloading embedder")
             self._model.close()
             self._model = None
+
+    def set_model_path(self, new_path: Path) -> None:
+        """Live-swap the embedding model file (see LlamaCppDriver.set_model_path).
+
+        Unloads any held model, repoints at ``new_path``, and refreshes
+        ``dimensions`` from the new file's GGUF header.  Safe when nothing is
+        loaded yet and safe to call repeatedly.  Callers must hold the
+        embedder's lock (see LockedEmbedder) so a swap can't race an in-flight
+        embedding pass.
+        """
+        if self._model is not None:
+            self.unload()
+        self._model_path = new_path
+        detected = gguf_embedding_dimension(new_path)
+        if detected is not None:
+            self.dimensions = detected
+
+    def model_path(self) -> Path:
+        """The current embedding model file (for reporting)."""
+        return self._model_path
 
     async def aclose(self) -> None:
         """Shutdown cleanup."""

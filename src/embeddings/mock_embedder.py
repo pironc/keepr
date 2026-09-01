@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from hashlib import blake2b
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +22,15 @@ _WORD_PATTERN = re.compile(r"[a-z0-9]+")
 class MockEmbedder:
     def __init__(self, dimensions: int = 64) -> None:
         self.dimensions = dimensions
+        # Mirrors the real embedder's trackable model file, so live-swapping is
+        # observable/assertable in tests too.
+        self._model_path = Path()
+
+    def set_model_path(self, new_path: Path) -> None:
+        self._model_path = new_path
+
+    def model_path(self) -> Path:
+        return self._model_path
 
     async def embed_documents(self, texts: list[str]) -> NDArray[np.float32]:
         if not texts:

@@ -11,13 +11,12 @@ from dataclasses import dataclass, field
 
 from fastapi import Request
 
+from src.concurrency import LockedEmbedder, LockedLLMDriver
 from src.config import Settings
 from src.db.pool import SQLiteConnectionPool
 from src.db.repository import Repository
-from src.embeddings.base import Embedder
 from src.ingestion.pipeline import IngestionPipeline
 from src.ingestion.worker import IngestionWorker
-from src.llm.base import LLMDriver
 from src.rag.engine import RagEngine
 from src.rag.generation_worker import GenerationWorker
 from src.rag.index_manager import IndexManager
@@ -27,8 +26,11 @@ from src.rag.index_manager import IndexManager
 class AppContext:
     settings: Settings
     repository: Repository
-    embedder: Embedder
-    llm_driver: LLMDriver
+    # Concrete lock-wrapped model handles, not the bare protocols — the route
+    # layer performs lock-protected live model swaps through these (async
+    # ``set_model_path`` under each resource's own asyncio.Lock).
+    embedder: LockedEmbedder
+    llm_driver: LockedLLMDriver
     index_manager: IndexManager
     pipeline: IngestionPipeline
     engine: RagEngine

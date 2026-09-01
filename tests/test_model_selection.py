@@ -172,7 +172,9 @@ def test_model_select_persists_choice(client: TestClient, tmp_path: Path) -> Non
     resp = client.post("/api/models/select", json={"role": "llm", "filename": "foo.gguf"})
 
     assert resp.status_code == 200
-    assert resp.json()["restart_required"] is True
+    # Selection now applies to the running process (live swap) — no restart.
+    assert resp.json()["restart_required"] is False
+    assert resp.json()["swapped"] is True
     assert load_model_selection(tmp_path / "selection.json") == {"llm": "foo.gguf"}
 
 
@@ -233,6 +235,79 @@ def test_model_status_reflects_selection_before_restart(
     # The menu reports the persisted choice, not the (still-loaded) model, so
     # a selection never appears to revert when the menu is reopened.
     assert data["active_llm"] == "foo.gguf"
+
+
+def test_model_select_llm_live_swaps_no_restart(client: TestClient, tmp_path: Path) -> None:
+    """A valid LLM selection swaps the running driver in-process (no restart)."""
+    (tmp_path / "models" / "foo.gguf").write_bytes(b"fake weights")
+
+    resp = client.post("/api/models/select", json={"role": "llm", "filename": "foo.gguf"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["swapped"] is True
+    assert body["restart_required"] is False
+    assert load_model_selection(tmp_path / "selection.json") == {"llm": "foo.gguf"}
+
+
+def test_model_select_embedding_same_dim_swaps(client: TestClient, tmp_path: Path) -> None:
+    """Same-width embedding swap live-swaps without requiring a restart.
+
+    The mock embedder reports 64 dims; a GGUF whose ``embedding_length`` matches
+    (also 64) must swap cleanly and not be refused.
+    """
+    _write_gguf(
+        tmp_path / "models" / "same.gguf",
+        [("general.architecture", 8, "foo-bert"), ("foo-bert.embedding_length", 4, struct.pack("<I", 64))],
+    )
+    resp = client.post("/api/models/select", json={"role": "embedding", "filename": "same.gguf"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["swapped"] is True
+    assert body.get("incompatible_dimensions") is None
+    assert load_model_selection(tmp_path / "selection.json") == {"embedding": "same.gguf"}
+
+
+def test_model_select_embedding_refuses_dimension_change(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """A different-width embedding swap must be refused, not silently allowed.
+
+    The index was built with the running embedder's width (mock → 64); a GGUF
+    that embeds to a different width would vstack into a shape-mismatch.
+    """
+    _write_gguf(
+        tmp_path / "models" / "wide.gguf",
+        [("general.architecture", 8, "foo-bert"), ("foo-bert.embedding_length", 4, struct.pack("<I", 1024))],
+    )
+
+    resp = client.post(
+        "/api/models/select", json={"role": "embedding", "filename": "wide.gguf"}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["swapped"] is False
+    assert body["incompatible_dimensions"] is True
+    # Refused swap ⇒ nothing persisted.
+    assert load_model_selection(tmp_path / "selection.json") == {}
+
+
+def test_model_select_embedding_unknown_dim_is_allowed(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """A GGUF whose width can't be read from the header is not refused — refusing
+    with no number to compare against would block valid same-width swaps."""
+    (tmp_path / "models" / "odd.gguf").write_bytes(b"fake weights")  # not a real GGUF
+
+    resp = client.post(
+        "/api/models/select", json={"role": "embedding", "filename": "odd.gguf"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["swapped"] is True
+    assert load_model_selection(tmp_path / "selection.json") == {"embedding": "odd.gguf"}
 
 
 def test_model_quit_returns_ok(client: TestClient) -> None:
